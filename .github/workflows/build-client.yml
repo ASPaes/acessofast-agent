@@ -70,6 +70,22 @@ env:
   # ---------------- Comportamento ---------------------------------------------
   removeNewVersionNotif: "true"   # mata o popup de update do RustDesk
   brandingEnabled: "true"         # aplica icone/logo de ./branding/ do repo
+
+  # ---------------- custom_.txt: a identidade do cliente ----------------------
+  # base64 de: {"app-name":"AcessoFast","override-settings":{"approve-mode":"password-click","allow-remote-config-modification":"Y","allow-logon-screen-password":"Y"}}
+  #
+  # 'app-name' define config::APP_NAME em runtime. Sem isso APP_NAME fica "RustDesk" e:
+  #   - o titulo da janela sai "RustDesk" (main.cpp nao e tocado por nenhum sed)
+  #   - is_custom_client() == false -> o popup de update aparece
+  #   - o cliente lê %APPDATA%\RustDesk\ e COLIDE com o RustDesk oficial
+  # Com app-name=AcessoFast -> namespace proprio %APPDATA%\AcessoFast\.
+  #
+  # 'override-settings' vence sobre a config do usuario (Override > User > Default).
+  # As 3 chaves sao politica da empresa, nao preferencia — por isso override e nao default.
+  # Provado em hbb_common/src/config.rs: approve-mode (:2933) e
+  # allow-remote-config-modification (:2915) em KEYS_SETTINGS;
+  # allow-logon-screen-password (:3001) em KEYS_BUILDIN_SETTINGS.
+  custom: "eyJhcHAtbmFtZSI6IkFjZXNzb0Zhc3QiLCJvdmVycmlkZS1zZXR0aW5ncyI6eyJhcHByb3ZlLW1vZGUiOiJwYXNzd29yZC1jbGljayIsImFsbG93LXJlbW90ZS1jb25maWctbW9kaWZpY2F0aW9uIjoiWSIsImFsbG93LWxvZ29uLXNjcmVlbi1wYXNzd29yZCI6IlkifX0="
   runasadmin: "false"
   cycleMonitor: "false"
   delayFix: "false"
@@ -562,12 +578,28 @@ jobs:
           Remove-Item ./rustdesk/unsigned_files.zip
           Remove-Item ./rustdesk/signed_files.zip
 
-      # REMOVIDO: o rdgen escrevia './rustdesk/custom_.txt' aqui.
-      # Verificado no fonte do RustDesk: load_custom_client() le 'custom.txt'
-      # (sem underscore) e read_custom_client() EXIGE assinatura RSA com a chave
-      # privada do RustDesk (const KEY 5Qbwsde3un... no src/common.rs).
-      # 'custom_.txt' tem ZERO referencias no upstream e o packer nao o consome.
-      # => era no-op. As advanced settings vao via RustDesk2.toml no instalador.
+      # RESTAURADO. Eu tinha removido este step por engano: procurei 'custom_.txt'
+      # no upstream do RustDesk, nao achei, e conclui que era no-op. Faltou olhar o
+      # patch allowCustom.py (step 'allow custom.txt', acima), que roda ANTES e:
+      #   1. remove as 9 linhas da verificacao RSA em src/common.rs
+      #      (const KEY 5Qbwsde3un... + get_rs_pk + sign::verify)
+      #   2. renomeia custom.txt -> custom_.txt DENTRO do codigo
+      # Ou seja: o underscore existe justamente pra desacoplar do canal assinado
+      # do RustDesk Pro. Sem este arquivo, APP_NAME fica "RustDesk" e o cliente
+      # colide com uma instalacao oficial na mesma maquina.
+      - name: Create custom.txt file
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ env.custom }}" ]; then
+            echo "::error::env.custom vazio — o cliente sairia identificado como RustDesk."
+            exit 1
+          fi
+          echo -n "${{ env.custom }}" > ./rustdesk/custom_.txt
+          echo "custom_.txt escrito ($(wc -c < ./rustdesk/custom_.txt) bytes)"
+          echo "conteudo decodificado (verificacao):"
+          base64 -d ./rustdesk/custom_.txt
+          echo ""
 
       - name: Build self-extracted executable
         shell: bash
