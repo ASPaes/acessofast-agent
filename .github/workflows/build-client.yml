@@ -11,11 +11,21 @@ run-name: "AcessoFast Client — RustDesk ${{ inputs.version }}"
 #   - zera admin.rustdesk.com (soberania: nenhuma chamada pra nuvem do RustDesk)
 #   - remove o popup "nova versao do RustDesk disponivel"
 #
-# O QUE ESTE BUILD **NAO** FAZ (verificado no fonte do RustDesk):
-#   - NAO embute advanced settings (approve-mode, allow-remote-config-modification,
-#     allow-logon-screen-password). O canal delas e o custom.txt, que exige
-#     assinatura RSA com a chave privada do RustDesk (lock-in do Pro).
-#     => essas 3 chaves continuam sendo injetadas via RustDesk2.toml pelo instalador.
+#   - embute as advanced settings via custom_.txt (approve-mode,
+#     allow-remote-config-modification, allow-logon-screen-password)
+#
+# SOBRE O custom_.txt (o ponto mais sutil deste workflow):
+#   O canal oficial e 'custom.txt', que EXIGE assinatura RSA da chave privada do
+#   RustDesk (const KEY 5Qbwsde3un... em read_custom_client) — lock-in do Pro.
+#   O patch allowCustom.py (step 'allow custom.txt') remove essas 9 linhas de
+#   verificacao e renomeia custom.txt -> custom_.txt no codigo. Por isso o
+#   underscore: nao e typo nem codigo morto — e o que desacopla do canal assinado.
+#   Sem este arquivo, APP_NAME fica "RustDesk", o cliente le %APPDATA%\RustDesk\
+#   e COLIDE com uma instalacao oficial na mesma maquina.
+#
+# REQUISITOS (o build aborta em ~10s se faltarem):
+#   - repo vars RELAY_HOST e RELAY_PUBKEY na aba VARIABLES (nao Secrets)
+#   - branding/icon.png (256x256 quadrado) e branding/logo.png
 
 on:
   workflow_dispatch:
@@ -95,12 +105,48 @@ env:
 
 
 jobs:
+  # Guard que faltava. Sem as vars, o `sed` do config.rs troca o relay por string
+  # VAZIA, o build fica VERDE e entrega um cliente que nao conecta em lugar nenhum
+  # (log do cliente: "start rendezvous mediator of " sem host). Falha silenciosa.
+  # Este job custa ~10s e aborta antes dos 48 min.
+  preflight:
+    name: Verificar configuracao
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vars obrigatorias (RELAY_HOST / RELAY_PUBKEY)
+        run: |
+          erro=0
+          if [ -z "${{ vars.RELAY_HOST }}" ]; then
+            echo "::error::RELAY_HOST vazio. Settings > Secrets and variables > Actions > aba VARIABLES (nao Secrets). vars.X nao le secrets."
+            erro=1
+          fi
+          if [ -z "${{ vars.RELAY_PUBKEY }}" ]; then
+            echo "::error::RELAY_PUBKEY vazio. Mesma aba VARIABLES."
+            erro=1
+          fi
+          if [ "$erro" -ne 0 ]; then exit 1; fi
+          echo "RELAY_HOST   = ${{ vars.RELAY_HOST }}"
+          echo "RELAY_PUBKEY = ${{ vars.RELAY_PUBKEY }}"
+          echo "OK — o cliente vai apontar para ${{ vars.RELAY_HOST }}"
+
+      - name: Sanidade do custom_.txt
+        run: |
+          if [ -z "${{ env.custom }}" ]; then
+            echo "::error::env.custom vazio — o cliente sairia identificado como RustDesk."
+            exit 1
+          fi
+          echo "custom_.txt decodificado:"
+          echo -n "${{ env.custom }}" | base64 -d
+          echo ""
+
   generate-bridge:
+    needs: preflight
     uses: ./.github/workflows/bridge.yml
     with:
       version: ${{ inputs.version }}
 
   build-RustDeskTempTopMostWindow:
+    needs: preflight
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     with:
       upload-artifact: true
@@ -114,7 +160,7 @@ jobs:
 
   build-for-windows-flutter:
     name: Build Windows
-    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    needs: [preflight, build-RustDeskTempTopMostWindow, generate-bridge]
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
