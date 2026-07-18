@@ -1,0 +1,86 @@
+name: Build AcessoFast Agent (Windows)
+run-name: "AcessoFast Agent — ${{ github.sha }}"
+
+# Compila o agente de sessao/matricula (Go) que o build-client.yml NAO compila.
+# Sem este workflow o acessofast-agent.exe nunca existe, e o instalador (.iss) nao
+# tem o que empacotar -> telemetria de sessao morta, connection_logs so 'failed'.
+#
+# Cross-compile Windows a partir do ubuntu: Go faz isso nativo, sem cgo, em ~segundos.
+# Nao precisa de runner Windows como o cliente RustDesk (que leva ~48 min).
+#
+# anonKey e publica por design (role=anon). Se o repo tiver a Variable
+# SUPABASE_ANON_KEY (aba Variables, NAO Secrets), ela e injetada via ldflags; senao,
+# o build usa o fallback hardcoded que ja esta no main.go (mesma chave). Nos dois
+# casos o binario sai funcional — a Variable e opcional.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "main.go"
+      - "enroll.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-agent.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Cross-compile Windows x64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go (versao do go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Baixar dependencias
+        run: go mod download
+
+      # go vet compila para o alvo real (Windows) -> pega erro de tipo/build que o
+      # gofmt nao ve. E aqui que um bug no patch do agente apareceria.
+      - name: Vet (GOOS=windows)
+        run: GOOS=windows GOARCH=amd64 go vet ./...
+
+      - name: Build
+        env:
+          ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w"
+          if [ -n "${ANON_KEY:-}" ]; then
+            LDFLAGS="$LDFLAGS -X main.anonKey=${ANON_KEY}"
+            echo "::notice::anonKey injetado via repo Variable SUPABASE_ANON_KEY"
+          else
+            echo "::notice::SUPABASE_ANON_KEY vazio — usando o fallback hardcoded do main.go (mesma chave)"
+          fi
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags "$LDFLAGS" -o acessofast-agent.exe .
+          ls -la acessofast-agent.exe
+
+      # Guarda: garante que saiu um executavel Windows (PE, header "MZ") e nao um
+      # ELF Linux por GOOS nao ter aplicado.
+      - name: Sanidade — o binario e PE/Windows?
+        run: |
+          set -euo pipefail
+          magic="$(head -c 2 acessofast-agent.exe)"
+          if [ "$magic" != "MZ" ]; then
+            echo "::error::Saida nao e executavel Windows (esperado header 'MZ', veio '$magic')."
+            exit 1
+          fi
+          echo "OK: PE Windows valido."
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: acessofast-agent-windows-x64
+          path: acessofast-agent.exe
+          retention-days: 30
+          if-no-files-found: error
