@@ -5,7 +5,7 @@
 //	acessofast-agent.exe --enroll --secret=<CODIGO_DA_EMPRESA> [--alias=<NOME>]
 //
 // Fluxo:
-//  1. Localiza o rustdesk.exe instalado
+//  1. Localiza o AcessoFast.exe (cliente branded) instalado
 //  2. Le o RustDesk ID (--get-id, com retry: o ID so existe apos o 1o run do servico)
 //  3. POST /functions/v1/enroll-device {secret, rustdesk_id, os, alias}
 //  4. Grava agent.token + rustdesk_id em C:\ProgramData\AcessoFast com ACL RESTRITA
@@ -22,8 +22,9 @@
 // Parte do BINARIO UNICO acessofast-agent.exe: o main.go decide, pela flag
 // --enroll, se roda o servico (default) ou esta matricula one-shot. As constantes
 // compartilhadas (baseDir, tokenFile, ridFile, anonKey) vivem em main.go — fonte unica.
-// Os paths batem com o agente que ja roda em producao (verificado por extracao de
-// strings do binario). Se divergirem, o agente nao acha o token e a telemetria morre calada.
+// Os paths de credencial (C:\ProgramData\AcessoFast) batem com o agente que ja roda
+// em producao. O path do cliente foi corrigido para o namespace branded AcessoFast
+// (confirmado em maquina real: C:\Program Files\AcessoFast\AcessoFast.exe).
 package main
 
 import (
@@ -96,7 +97,13 @@ func failWith(code int, format string, a ...any) *enrollExitError {
 }
 
 // ---------------------------------------------------------------------------
-// Localizacao do RustDesk
+// Localizacao do cliente branded (AcessoFast.exe)
+//
+// O binario e RustDesk por baixo, mas o build branded renomeia o app-name para
+// AcessoFast: o exe vira AcessoFast.exe e instala em C:\Program Files\AcessoFast
+// (confirmado em maquina real, e no InstallLocation do registro de Uninstall).
+// Procurar "RustDesk\rustdesk.exe" — como era antes — falha em toda maquina com
+// o cliente branded, e a matricula morre aqui com exit 4.
 // ---------------------------------------------------------------------------
 
 func findRustDeskExe() (string, error) {
@@ -104,13 +111,13 @@ func findRustDeskExe() (string, error) {
 
 	for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"} {
 		if base := os.Getenv(env); base != "" {
-			candidates = append(candidates, filepath.Join(base, "RustDesk", "rustdesk.exe"))
+			candidates = append(candidates, filepath.Join(base, "AcessoFast", "AcessoFast.exe"))
 		}
 	}
 	// Fallback literal, caso as env vars estejam vazias (contexto de servico atipico).
 	candidates = append(candidates,
-		`C:\Program Files\RustDesk\rustdesk.exe`,
-		`C:\Program Files (x86)\RustDesk\rustdesk.exe`,
+		`C:\Program Files\AcessoFast\AcessoFast.exe`,
+		`C:\Program Files (x86)\AcessoFast\AcessoFast.exe`,
 	)
 
 	seen := map[string]bool{}
@@ -123,7 +130,7 @@ func findRustDeskExe() (string, error) {
 			return p, nil
 		}
 	}
-	return "", errors.New("rustdesk.exe nao encontrado nos caminhos padrao")
+	return "", errors.New("AcessoFast.exe nao encontrado nos caminhos padrao")
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +304,7 @@ func RunEnroll(secret, alias string) int {
 		fmt.Printf("ERRO: %v\n", err)
 		return exitNoRustDeskID
 	}
-	fmt.Printf("  RustDesk localizado: %s\n", exe)
+	fmt.Printf("  Cliente AcessoFast localizado: %s\n", exe)
 
 	fmt.Println("  Aguardando o ID desta maquina ser gerado...")
 	rid, err := getRustDeskID(exe)
@@ -335,4 +342,3 @@ func RunEnroll(secret, alias string) int {
 	fmt.Println("OK")
 	return exitOK
 }
-
