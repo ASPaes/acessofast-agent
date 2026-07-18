@@ -3,9 +3,19 @@
 // Sem argumentos          -> roda como servico Windows (ou console em debug).
 // Com --enroll            -> executa a matricula do endpoint UMA vez e sai.
 //
-// O agente detecta sessao RustDesk lendo o "connection count" do log
-// rustdesk_rCURRENT.log e reporta start/heartbeat/end para a Edge Function
-// session-ingest. Envia "presence" quando ocioso (so atualiza last_online).
+// Deteccao de sessao: o agente faz tail do log do cliente branded (namespace
+// AcessoFast, subpasta server) e pareia as linhas "#N Connection opened" /
+// "#N Connection closed" que o motor RustDesk emite por conexao. Mantem o
+// conjunto de #N abertos: primeira abertura -> "start"; ultimo fechamento ->
+// "end"; heartbeat enquanto houver #N aberto; "presence" quando ocioso. Suporta
+// sessoes simultaneas (varios #N) e expira #N preso ha >24h (close perdido numa
+// rotacao de log).
+//
+// NOTA (aprendido em log real, nao deduzido): o marcador "connection count: N"
+// NAO serve — ele reloga varias vezes durante a sessao e NUNCA cai para 0 no
+// fim (o encoder e destruido sem relogar a contagem). O par #N opened/closed
+// (src/server/connection.rs) e o unico sinal confiavel de inicio/fim.
+//
 // Loga em C:\ProgramData\AcessoFast\agent.log.
 //
 // O caminho --enroll vive em enroll.go: le o RustDesk ID, chama enroll-device,
@@ -22,7 +32,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,8 +64,12 @@ const (
 var anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsbWZ5aWJ5cm93YmdqanlibGNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM2NDMyNjIsImV4cCI6MjA5OTIxOTI2Mn0.grcQYqN3fHvFTWI0AFPWG66k1wONuGqZ5yMt07qcjxE"
 
 var (
-	countRe = regexp.MustCompile(`connection count:\s*(\d+)`)
-	diagRe  = regexp.MustCompile(`(?i)connection count|new client|close|closed|offline|disconnect|stop video|exit .*service|LoginRequest|authorized`)
+	// Marcadores reais confirmados em log de producao (connection.rs):
+	//   #619 Connection opened from 189.4.111.147:12288.
+	//   #619 Connection closed: Peer close
+	openedRe = regexp.MustCompile(`#(\d+) Connection opened`)
+	closedRe = regexp.MustCompile(`#(\d+) Connection closed`)
+	diagRe   = regexp.MustCompile(`(?i)Connection opened|Connection closed|new client|LoginRequest|authorized`)
 
 	logMu sync.Mutex
 	logFH *os.File
@@ -84,15 +97,17 @@ func readTrim(path string) string {
 }
 
 // Descobre o rustdesk_id: arquivo dedicado (autoridade do instalador) ou, fallback,
-// varre a config do RustDesk procurando o campo id.
+// varre a config do cliente branded procurando o campo id. Namespace = AcessoFast
+// (confirmado em maquina real: ...\AcessoFast\config\AcessoFast2.toml).
 func discoverRustdeskID() string {
 	if v := readTrim(ridFile); v != "" {
 		return v
 	}
 	globs := []string{
-		`C:\Users\*\AppData\Roaming\RustDesk\config\RustDesk.toml`,
-		`C:\Users\*\AppData\Roaming\RustDesk\config\RustDesk2.toml`,
-		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk.toml`,
+		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\config\AcessoFast.toml`,
+		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\config\AcessoFast2.toml`,
+		`C:\Users\*\AppData\Roaming\AcessoFast\config\AcessoFast.toml`,
+		`C:\Users\*\AppData\Roaming\AcessoFast\config\AcessoFast2.toml`,
 	}
 	idRe := regexp.MustCompile(`(?m)^\s*id\s*=\s*['"]?([0-9]{6,})`)
 	for _, g := range globs {
@@ -110,12 +125,16 @@ func discoverRustdeskID() string {
 	return ""
 }
 
+// findRustdeskLog aponta para o log de SESSAO do cliente branded. Confirmado em
+// maquina real: o namespace segue o app-name (AcessoFast_rCURRENT.log), sob a
+// conta LocalService (onde o servico do cliente roda), na subpasta "server" —
+// que e onde os eventos "#N Connection opened/closed" sao escritos.
 func findRustdeskLog() string {
 	patterns := []string{
-		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\log\rustdesk_rCURRENT.log`,
-		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\log\server\rustdesk_rCURRENT.log`,
-		`C:\Users\*\AppData\Roaming\RustDesk\log\rustdesk_rCURRENT.log`,
-		`C:\Users\*\AppData\Local\rustdesk\log\rustdesk_rCURRENT.log`,
+		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\log\server\AcessoFast_rCURRENT.log`,
+		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\log\AcessoFast_rCURRENT.log`,
+		`C:\Users\*\AppData\Roaming\AcessoFast\log\server\AcessoFast_rCURRENT.log`,
+		`C:\Users\*\AppData\Roaming\AcessoFast\log\AcessoFast_rCURRENT.log`,
 	}
 	var best string
 	var bestT time.Time
@@ -161,30 +180,62 @@ func postEvent(event string) {
 	logln("POST %s -> HTTP %d  %s", event, resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
+// tailer acompanha o log e mantem o conjunto de conexoes (#N) abertas.
+// active == len(open) > 0. Estado sequencial: so e tocado dentro do select do
+// worker (uma unica goroutine) — sem necessidade de mutex.
 type tailer struct {
 	path   string
 	offset int64
 	primed bool
-	active bool
+	open   map[string]time.Time // #N aberto -> instante em que vimos o "opened"
 }
 
 func (t *tailer) processLine(line string) {
 	if diagRe.MatchString(line) {
 		logln("DIAG log: %s", strings.TrimSpace(line))
 	}
-	m := countRe.FindStringSubmatch(line)
-	if m == nil {
+	if m := openedRe.FindStringSubmatch(line); m != nil {
+		id := m[1]
+		if _, exists := t.open[id]; !exists {
+			wasEmpty := len(t.open) == 0
+			t.open[id] = time.Now()
+			logln(">>> conexao #%s aberta (abertas agora: %d)", id, len(t.open))
+			if wasEmpty {
+				logln(">>> SESSAO INICIADA")
+				postEvent("start")
+			}
+		}
 		return
 	}
-	cnt, _ := strconv.Atoi(m[1])
-	if cnt >= 1 && !t.active {
-		t.active = true
-		logln(">>> SESSAO INICIADA (connection count = %d)", cnt)
-		postEvent("start")
-	} else if cnt == 0 && t.active {
-		t.active = false
-		logln("<<< SESSAO ENCERRADA (connection count = 0)")
-		postEvent("end")
+	if m := closedRe.FindStringSubmatch(line); m != nil {
+		id := m[1]
+		if _, exists := t.open[id]; exists {
+			delete(t.open, id)
+			logln("<<< conexao #%s fechada (abertas agora: %d)", id, len(t.open))
+			if len(t.open) == 0 {
+				logln("<<< SESSAO ENCERRADA")
+				postEvent("end")
+			}
+		}
+	}
+}
+
+// expireStale remove #N preso ha mais de 24h. Um "closed" pode se perder numa
+// rotacao de log (opened num arquivo, closed noutro); sem esta guarda o agente
+// mandaria heartbeat pra sempre e o faturamento nunca fecharia a sessao. Se a
+// expiracao esvaziar o conjunto, forca "end" — a duracao sai inflada, mas o
+// caso e raro e filtravel por duracao no backend.
+func (t *tailer) expireStale() {
+	const maxAge = 24 * time.Hour
+	now := time.Now()
+	for id, seen := range t.open {
+		if now.Sub(seen) > maxAge {
+			delete(t.open, id)
+			logln("WARN conexao #%s expirada (>24h sem 'closed') — forcando fim", id)
+			if len(t.open) == 0 {
+				postEvent("end")
+			}
+		}
 	}
 }
 
@@ -194,7 +245,7 @@ func (t *tailer) poll() {
 		return
 	}
 	if p != t.path {
-		logln("log RustDesk: %s", p)
+		logln("log do cliente: %s", p)
 		t.path = p
 		t.offset = 0
 		t.primed = false
@@ -205,8 +256,9 @@ func (t *tailer) poll() {
 	}
 	if fi.Size() < t.offset { // rotacionou/truncou
 		t.offset = 0
-		t.primed = false
-		logln("log rotacionou, relendo do inicio")
+		// NAO limpa t.open nem re-prima: as conexoes abertas atravessam a
+		// rotacao; so voltamos a ler o novo arquivo do inicio.
+		logln("log rotacionou; relendo do novo arquivo (abertas: %d)", len(t.open))
 	}
 	f, err := os.Open(p)
 	if err != nil {
@@ -219,20 +271,22 @@ func (t *tailer) poll() {
 
 	lines := strings.Split(string(data), "\n")
 	if !t.primed {
-		// Prime: estado atual pelo ULTIMO connection count, sem disparar eventos historicos.
-		last := -1
+		// Reconstrucao de estado no boot: reproduz opened/closed do arquivo
+		// atual SEM postar eventos historicos. Se sobrar #N aberto, ha sessao
+		// ativa agora -> um unico "start".
 		for _, ln := range lines {
-			if m := countRe.FindStringSubmatch(ln); m != nil {
-				last, _ = strconv.Atoi(m[1])
+			if m := openedRe.FindStringSubmatch(ln); m != nil {
+				t.open[m[1]] = time.Now()
+			} else if m := closedRe.FindStringSubmatch(ln); m != nil {
+				delete(t.open, m[1])
 			}
 		}
 		t.primed = true
-		if last >= 1 {
-			t.active = true
-			logln("prime: sessao JA ativa no boot (count=%d) -> enviando start", last)
+		if len(t.open) > 0 {
+			logln("prime: %d conexao(oes) aberta(s) no boot -> enviando start", len(t.open))
 			postEvent("start")
 		} else {
-			logln("prime: sem sessao ativa (count=%d)", last)
+			logln("prime: sem sessao ativa no boot")
 		}
 		return
 	}
@@ -241,6 +295,7 @@ func (t *tailer) poll() {
 			t.processLine(ln)
 		}
 	}
+	t.expireStale()
 }
 
 func worker(stop <-chan struct{}) {
@@ -253,12 +308,12 @@ func worker(stop <-chan struct{}) {
 	}
 	rustdeskID = discoverRustdeskID()
 	if rustdeskID == "" {
-		logln("ERRO: rustdesk_id nao encontrado (nem %s nem config do RustDesk)", ridFile)
+		logln("ERRO: rustdesk_id nao encontrado (nem %s nem config do cliente)", ridFile)
 	} else {
 		logln("rustdesk_id = %s", rustdeskID)
 	}
 
-	t := &tailer{}
+	t := &tailer{open: make(map[string]time.Time)}
 	pollT := time.NewTicker(pollInterval)
 	hbT := time.NewTicker(heartbeatInterval)
 	presT := time.NewTicker(presenceInterval)
@@ -276,11 +331,11 @@ func worker(stop <-chan struct{}) {
 		case <-pollT.C:
 			t.poll()
 		case <-hbT.C:
-			if t.active {
+			if len(t.open) > 0 {
 				postEvent("heartbeat")
 			}
 		case <-presT.C:
-			if !t.active {
+			if len(t.open) == 0 {
 				postEvent("presence")
 			}
 		}
