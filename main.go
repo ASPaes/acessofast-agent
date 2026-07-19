@@ -125,20 +125,26 @@ func discoverRustdeskID() string {
 	return ""
 }
 
-// findRustdeskLog aponta para o log de SESSAO do cliente branded. Confirmado em
-// maquina real: o namespace segue o app-name (AcessoFast_rCURRENT.log), sob a
-// conta LocalService (onde o servico do cliente roda), na subpasta "server" —
-// que e onde os eventos "#N Connection opened/closed" sao escritos.
+// findRustdeskLog aponta para o log de SESSAO do cliente branded. Namespace segue
+// o app-name (AcessoFast_rCURRENT.log), e SO interessa o log da subpasta "server":
+// e a unica onde o motor escreve "#N Connection opened/closed" (connection.rs,
+// lado servidor = quem RECEBE a sessao). Logs fora de server\ (UI / lado que
+// controla) NAO tem esses eventos.
+//
+// Aprendido em teste real (maquina do Ryan): escolher pelo mtime pegava o log de
+// usuario (C:\Users\...\log\AcessoFast_rCURRENT.log), mais recente porem SEM os
+// eventos -> agente cego. Por isso agora so olhamos server\; se nao existir,
+// retorna "" e o poll re-tenta a cada 3s (o log server\ nasce na 1a sessao
+// recebida — ate la nao ha nada pra detectar naquela maquina).
 func findRustdeskLog() string {
-	patterns := []string{
+	serverLogs := []string{
 		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\log\server\AcessoFast_rCURRENT.log`,
-		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\log\AcessoFast_rCURRENT.log`,
+		`C:\Windows\System32\config\systemprofile\AppData\Roaming\AcessoFast\log\server\AcessoFast_rCURRENT.log`,
 		`C:\Users\*\AppData\Roaming\AcessoFast\log\server\AcessoFast_rCURRENT.log`,
-		`C:\Users\*\AppData\Roaming\AcessoFast\log\AcessoFast_rCURRENT.log`,
 	}
 	var best string
 	var bestT time.Time
-	for _, p := range patterns {
+	for _, p := range serverLogs {
 		matches, _ := filepath.Glob(p)
 		for _, m := range matches {
 			if fi, err := os.Stat(m); err == nil && fi.ModTime().After(bestT) {
