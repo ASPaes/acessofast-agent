@@ -308,10 +308,14 @@ func worker(stop <-chan struct{}) {
 	logln("===== AcessoFast agent iniciado =====")
 	token = readTrim(tokenFile)
 	if token == "" {
-		logln("ERRO: token vazio/ausente em %s", tokenFile)
-	} else {
-		logln("token carregado (len=%d)", len(token))
+		logln("sem token em %s -> MODO MATRICULA", tokenFile)
+		if !runMatricula(stop) {
+			logln("===== agent parando (matricula interrompida) =====")
+			return
+		}
+		token = readTrim(tokenFile) // re-le o token ja confirmado
 	}
+	logln("token carregado (len=%d)", len(token))
 	rustdeskID = discoverRustdeskID()
 	if rustdeskID == "" {
 		logln("ERRO: rustdesk_id nao encontrado (nem %s nem config do cliente)", ridFile)
