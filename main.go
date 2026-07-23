@@ -221,6 +221,9 @@ func (t *tailer) processLine(line string) {
 			if len(t.open) == 0 {
 				logln("<<< SESSAO ENCERRADA")
 				postEvent("end")
+				// Fase 2: gira a senha efemera ao fim da sessao. Em goroutine — faz
+				// exec (--password) + HTTP e nao pode bloquear o poll de deteccao.
+				go rotateNow()
 			}
 		}
 	}
@@ -322,6 +325,9 @@ func worker(stop <-chan struct{}) {
 	} else {
 		logln("rustdesk_id = %s", rustdeskID)
 	}
+
+	// Fase 2: reenvia qualquer senha pendente (report que nao teve 200) ate o painel confirmar.
+	go rotateRetryLoop(stop)
 
 	t := &tailer{open: make(map[string]time.Time)}
 	pollT := time.NewTicker(pollInterval)
