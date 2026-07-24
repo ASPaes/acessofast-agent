@@ -82,7 +82,10 @@ env:
   brandingEnabled: "true"         # aplica icone/logo de ./branding/ do repo
 
   # ---------------- custom_.txt: a identidade do cliente ----------------------
-  # base64 de: {"app-name":"AcessoFast","override-settings":{"approve-mode":"password-click","allow-remote-config-modification":"Y","allow-logon-screen-password":"Y"}}
+  # base64 de: {"app-name":"AcessoFast","override-settings":{"approve-mode":"password","allow-remote-config-modification":"N","allow-logon-screen-password":"Y"}}
+  # Fase 3 base (§4.1): approve-mode=password (exige senha, fecha o bypass do "Aceitar"/#5)
+  # e allow-remote-config-modification=N (impede reconfigurar o device por dentro da sessao/#4).
+  # Validado no canary via flip local do custom_.txt (device 51200651) antes de assar aqui.
   #
   # 'app-name' define config::APP_NAME em runtime. Sem isso APP_NAME fica "RustDesk" e:
   #   - o titulo da janela sai "RustDesk" (main.cpp nao e tocado por nenhum sed)
@@ -95,7 +98,7 @@ env:
   # Provado em hbb_common/src/config.rs: approve-mode (:2933) e
   # allow-remote-config-modification (:2915) em KEYS_SETTINGS;
   # allow-logon-screen-password (:3001) em KEYS_BUILDIN_SETTINGS.
-  custom: "eyJhcHAtbmFtZSI6IkFjZXNzb0Zhc3QiLCJvdmVycmlkZS1zZXR0aW5ncyI6eyJhcHByb3ZlLW1vZGUiOiJwYXNzd29yZC1jbGljayIsImFsbG93LXJlbW90ZS1jb25maWctbW9kaWZpY2F0aW9uIjoiWSIsImFsbG93LWxvZ29uLXNjcmVlbi1wYXNzd29yZCI6IlkifX0="
+  custom: "eyJhcHAtbmFtZSI6IkFjZXNzb0Zhc3QiLCJvdmVycmlkZS1zZXR0aW5ncyI6eyJhcHByb3ZlLW1vZGUiOiJwYXNzd29yZCIsImFsbG93LXJlbW90ZS1jb25maWctbW9kaWZpY2F0aW9uIjoiTiIsImFsbG93LWxvZ29uLXNjcmVlbi1wYXNzd29yZCI6IlkifX0="
   runasadmin: "false"
   cycleMonitor: "false"
   delayFix: "false"
