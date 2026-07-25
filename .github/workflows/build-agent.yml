@@ -21,6 +21,7 @@ on:
       - "main.go"
       - "enroll.go"
       - "matricula.go"
+      - "rotate.go"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/build-agent.yml"

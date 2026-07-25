@@ -36,6 +36,12 @@ const (
 	rotateURL         = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/rotate-device-secret"
 	pendingFile       = baseDir + `\rotate.pending` // senha JA aplicada no endpoint aguardando confirmacao do painel
 	rotateRetryPeriod = 30 * time.Second
+
+	// holdFile (§4.3): "hold de manutencao". Timestamp RFC3339; enquanto now<hold_until,
+	// o rotate-on-boot (§3.2) e suprimido (reboot planejado — a sessao pode voltar
+	// sozinha). Ausente/ilegivel/expirado = sem hold. O caminho painel->agente que
+	// ESCREVE este arquivo e trabalho do §4.3; aqui o agente apenas LE.
+	holdFile = baseDir + `\hold.until`
 )
 
 // Politica de senha — ESPELHA provision-device-secret (alfabeto sem ambiguos 0 O 1 l I).
@@ -173,6 +179,38 @@ func rotateNow() {
 	} else {
 		logln("ROTATE pendente: aplicada no endpoint, painel ainda nao confirmou (retry em background)")
 	}
+}
+
+// holdActive: true se ha um "hold de manutencao" vigente (§4.3) — o operador sinalizou
+// um reboot planejado e nao queremos rotacionar no boot (a sessao pode voltar sozinha
+// dentro da janela). O hold e um timestamp RFC3339 em holdFile. Ausente/ilegivel/
+// expirado => sem hold (fail-secure: na duvida, rotaciona).
+func holdActive() bool {
+	v := readTrim(holdFile)
+	if v == "" {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		logln("HOLD ignorado: %s ilegivel (%q): %v", holdFile, v, err)
+		return false
+	}
+	if time.Now().Before(until) {
+		logln("HOLD ativo ate %s — rotate-on-boot suprimido", until.Format(time.RFC3339))
+		return true
+	}
+	return false
+}
+
+// rotateOnBoot implementa §3.2: rotaciona 1x no startup do agente, exceto sob hold.
+// Chamada em goroutine pelo worker() (faz exec + HTTP). rotateNow ja e idempotente
+// quanto a token/rustdesk_id ausentes e serializa em rotateMu com o retry loop.
+func rotateOnBoot() {
+	if holdActive() {
+		return
+	}
+	logln("ROTATE boot: rotacionando senha no startup (fecha 'senha sobrevive ao reboot')")
+	rotateNow()
 }
 
 // rotateRetryLoop reenvia a senha pendente ate o painel confirmar. Roda ate stop.

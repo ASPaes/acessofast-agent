@@ -53,6 +53,12 @@ const (
 	pollInterval      = 3 * time.Second
 	heartbeatInterval = 20 * time.Second
 	presenceInterval  = 60 * time.Second
+
+	// Fase 3 §3.1 — janela de carencia (debounce) do fim de sessao. Ao esvaziar o
+	// conjunto de #N, NAO encerra/rotaciona na hora: espera este prazo por uma
+	// reconexao (blip/queda curta, validado no teste #3). Reconexao dentro do prazo =
+	// mesma sessao (sem end, sem rotacao, sem churn de quota). Prazo vazio = fim real.
+	graceWindow = 60 * time.Second
 )
 
 // anonKey e publica por design (role=anon). Preferencia: injetar no CI via
@@ -194,6 +200,11 @@ type tailer struct {
 	offset int64
 	primed bool
 	open   map[string]time.Time // #N aberto -> instante em que vimos o "opened"
+
+	// graceUntil (§3.1): quando o conjunto de #N esvazia, arma-se o prazo de carencia.
+	// Zero = desarmado. Uma reconexao antes do prazo cancela; o prazo estourando vazio
+	// dispara o fim de sessao adiado (postEvent("end") + rotateNow) via checkGrace().
+	graceUntil time.Time
 }
 
 func (t *tailer) processLine(line string) {
@@ -207,8 +218,16 @@ func (t *tailer) processLine(line string) {
 			t.open[id] = time.Now()
 			logln(">>> conexao #%s aberta (abertas agora: %d)", id, len(t.open))
 			if wasEmpty {
-				logln(">>> SESSAO INICIADA")
-				postEvent("start")
+				// §3.1: se havia carencia armada, este open e uma RECONEXAO da mesma
+				// sessao (blip/queda curta) -> cancela a carencia e NAO re-emite start
+				// (sem novo grant, sem flag de "acesso externo", sem churn de quota).
+				if !t.graceUntil.IsZero() {
+					t.graceUntil = time.Time{}
+					logln(">>> reconexao dentro da carencia — mesma sessao (start/rotacao suprimidos)")
+				} else {
+					logln(">>> SESSAO INICIADA")
+					postEvent("start")
+				}
 			}
 		}
 		return
@@ -219,13 +238,30 @@ func (t *tailer) processLine(line string) {
 			delete(t.open, id)
 			logln("<<< conexao #%s fechada (abertas agora: %d)", id, len(t.open))
 			if len(t.open) == 0 {
-				logln("<<< SESSAO ENCERRADA")
-				postEvent("end")
-				// Fase 2: gira a senha efemera ao fim da sessao. Em goroutine — faz
-				// exec (--password) + HTTP e nao pode bloquear o poll de deteccao.
-				go rotateNow()
+				// §3.1: NAO encerra/rotaciona na hora. Arma a carencia; se uma reconexao
+				// chegar antes do prazo, e a mesma sessao. Se o prazo estourar vazio,
+				// checkGrace() encerra (postEvent("end")) e rotaciona a senha efemera.
+				t.graceUntil = time.Now().Add(graceWindow)
+				logln("<<< sessao vazia — carencia de %s armada (aguarda reconexao)", graceWindow)
 			}
 		}
+	}
+}
+
+// checkGrace dispara o fim de sessao ADIADO quando a carencia (§3.1) expira sem que
+// tenha chegado uma reconexao. Chamado a cada tick do poll (granularidade ~pollInterval
+// sobre graceWindow — ex.: 3s sobre 60s, aceitavel). Roda na mesma goroutine do worker.
+func (t *tailer) checkGrace() {
+	if t.graceUntil.IsZero() || len(t.open) > 0 {
+		return
+	}
+	if time.Now().After(t.graceUntil) {
+		t.graceUntil = time.Time{}
+		logln("<<< carencia expirou sem reconexao — SESSAO ENCERRADA")
+		postEvent("end")
+		// Fase 2: gira a senha efemera so agora, no fim REAL da sessao. Em goroutine —
+		// faz exec (--password) + HTTP e nao pode bloquear o poll de deteccao.
+		go rotateNow()
 	}
 }
 
@@ -329,6 +365,12 @@ func worker(stop <-chan struct{}) {
 	// Fase 2: reenvia qualquer senha pendente (report que nao teve 200) ate o painel confirmar.
 	go rotateRetryLoop(stop)
 
+	// Fase 3 §3.2: rotaciona 1x no boot do agente. O timer de carencia (§3.1) vive em
+	// memoria e NAO sobrevive a um reboot — sem isto, a senha vista antes do reboot
+	// continuaria valida (furo R2a/#8). Suprimido sob hold de manutencao (reboot
+	// planejado, §4.3). Goroutine: faz exec (--password) + HTTP, nao bloqueia o startup.
+	go rotateOnBoot()
+
 	t := &tailer{open: make(map[string]time.Time)}
 	pollT := time.NewTicker(pollInterval)
 	hbT := time.NewTicker(heartbeatInterval)
@@ -346,12 +388,15 @@ func worker(stop <-chan struct{}) {
 			return
 		case <-pollT.C:
 			t.poll()
+			t.checkGrace() // §3.1: fecha a sessao adiada quando a carencia expira
 		case <-hbT.C:
 			if len(t.open) > 0 {
 				postEvent("heartbeat")
 			}
 		case <-presT.C:
-			if len(t.open) == 0 {
+			// Durante a carencia (§3.1) a sessao ainda nao terminou de fato -> nao
+			// mandar "presence" (que so vale pra maquina comprovadamente ociosa).
+			if len(t.open) == 0 && t.graceUntil.IsZero() {
 				postEvent("presence")
 			}
 		}
