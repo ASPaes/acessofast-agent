@@ -164,12 +164,21 @@ func findRustdeskLog() string {
 
 var httpClient = &http.Client{Timeout: 12 * time.Second}
 
-func postEvent(event string) {
+// ingestResp: campos da resposta da session-ingest que o agente usa. Billing B2:
+// hard_cap_at = instante do corte rigido de 2h do free (RFC3339). Vem so em
+// start/heartbeat de sessao FREE iniciada pelo painel; ausente/vazio nos demais.
+type ingestResp struct {
+	HardCapAt string `json:"hard_cap_at"`
+}
+
+// postEvent posta um evento de sessao e devolve o hard_cap_at da resposta (zero se
+// ausente/ilegivel/erro). So start/heartbeat carregam cap; end/presence retornam zero.
+func postEvent(event string) time.Time {
 	// Guarda: sem credencial, nao adianta postar — a session-ingest rejeitaria.
 	// Evita ruido de POST invalido a cada 60s quando a matricula ainda nao rodou.
 	if token == "" || rustdeskID == "" {
 		logln("SKIP %s: token/rustdesk_id ausente (matricula pendente?)", event)
-		return
+		return time.Time{}
 	}
 	payload, _ := json.Marshal(map[string]string{
 		"rustdesk_id": rustdeskID, "agent_token": token, "event": event,
@@ -177,7 +186,7 @@ func postEvent(event string) {
 	req, err := http.NewRequest("POST", ingestURL, bytes.NewReader(payload))
 	if err != nil {
 		logln("POST %s erro ao montar req: %v", event, err)
-		return
+		return time.Time{}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("apikey", anonKey)
@@ -185,11 +194,24 @@ func postEvent(event string) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		logln("POST %s FALHOU: %v", event, err)
-		return
+		return time.Time{}
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
 	logln("POST %s -> HTTP %d  %s", event, resp.StatusCode, strings.TrimSpace(string(body)))
+
+	// Billing B2: extrai o hard_cap_at (se veio). Tolera fracao de segundo do timestamptz.
+	var r ingestResp
+	if json.Unmarshal(body, &r) == nil && r.HardCapAt != "" {
+		if ts, e := time.Parse(time.RFC3339, r.HardCapAt); e == nil {
+			return ts
+		}
+		if ts, e := time.Parse(time.RFC3339Nano, r.HardCapAt); e == nil {
+			return ts
+		}
+		logln("WARN hard_cap_at ilegivel: %q", r.HardCapAt)
+	}
+	return time.Time{}
 }
 
 // tailer acompanha o log e mantem o conjunto de conexoes (#N) abertas.
@@ -205,6 +227,12 @@ type tailer struct {
 	// Zero = desarmado. Uma reconexao antes do prazo cancela; o prazo estourando vazio
 	// dispara o fim de sessao adiado (postEvent("end") + rotateNow) via checkGrace().
 	graceUntil time.Time
+
+	// hardCapUntil (Billing B2): corte rigido de 2h do free. Armado quando a resposta
+	// da session-ingest (start/heartbeat) traz hard_cap_at. Zero = sem cap (credito/
+	// plano/externo). checkHardCap() corta ao vencer: rotaciona + reinicia o cliente
+	// (derruba a sessao). Limpo no fim real da sessao pra nao vazar pro proximo atendimento.
+	hardCapUntil time.Time
 }
 
 func (t *tailer) processLine(line string) {
@@ -226,7 +254,10 @@ func (t *tailer) processLine(line string) {
 					logln(">>> reconexao dentro da carencia — mesma sessao (start/rotacao suprimidos)")
 				} else {
 					logln(">>> SESSAO INICIADA")
-					postEvent("start")
+					if hc := postEvent("start"); !hc.IsZero() {
+						t.hardCapUntil = hc
+						logln(">>> corte de 2h (free) armado para %s", hc.Format(time.RFC3339))
+					}
 				}
 			}
 		}
@@ -257,11 +288,30 @@ func (t *tailer) checkGrace() {
 	}
 	if time.Now().After(t.graceUntil) {
 		t.graceUntil = time.Time{}
+		t.hardCapUntil = time.Time{} // fim real -> desarma o cap 2h (nao vaza pro proximo atendimento)
 		logln("<<< carencia expirou sem reconexao — SESSAO ENCERRADA")
 		postEvent("end")
 		// Fase 2: gira a senha efemera so agora, no fim REAL da sessao. Em goroutine —
 		// faz exec (--password) + HTTP e nao pode bloquear o poll de deteccao.
 		go rotateNow()
+	}
+}
+
+// checkHardCap (Billing B2): corte rigido de 2h do free. Chamado a cada tick do poll.
+// Ao vencer hardCapUntil com sessao ainda aberta: desarma, rotaciona a senha (mata a
+// que o tecnico viu) e reinicia o cliente branded (derruba a conexao ativa). O fim
+// natural (log fecha -> carencia -> end) fecha a sessao no banco em seguida.
+func (t *tailer) checkHardCap() {
+	if t.hardCapUntil.IsZero() || len(t.open) == 0 {
+		return
+	}
+	if time.Now().After(t.hardCapUntil) {
+		t.hardCapUntil = time.Time{} // desarma ANTES de agir -> nao corta de novo no proximo tick
+		logln("<<< CORTE 2h (free): limite atingido — rotacionando senha e derrubando a sessao")
+		go func() {
+			rotateNow()             // 1) nova senha no endpoint (a vista morre)
+			restartClientService()  // 2) reinicia o cliente -> a conexao ativa cai
+		}()
 	}
 }
 
@@ -278,6 +328,7 @@ func (t *tailer) expireStale() {
 			delete(t.open, id)
 			logln("WARN conexao #%s expirada (>24h sem 'closed') — forcando fim", id)
 			if len(t.open) == 0 {
+				t.hardCapUntil = time.Time{} // fim forcado -> desarma o cap 2h
 				postEvent("end")
 			}
 		}
@@ -329,7 +380,10 @@ func (t *tailer) poll() {
 		t.primed = true
 		if len(t.open) > 0 {
 			logln("prime: %d conexao(oes) aberta(s) no boot -> enviando start", len(t.open))
-			postEvent("start")
+			if hc := postEvent("start"); !hc.IsZero() {
+				t.hardCapUntil = hc
+				logln(">>> corte de 2h (free) armado para %s", hc.Format(time.RFC3339))
+			}
 		} else {
 			logln("prime: sem sessao ativa no boot")
 		}
@@ -388,10 +442,15 @@ func worker(stop <-chan struct{}) {
 			return
 		case <-pollT.C:
 			t.poll()
-			t.checkGrace() // §3.1: fecha a sessao adiada quando a carencia expira
+			t.checkGrace()   // §3.1: fecha a sessao adiada quando a carencia expira
+			t.checkHardCap() // B2: corta o free ao vencer o cap de 2h
 		case <-hbT.C:
 			if len(t.open) > 0 {
-				postEvent("heartbeat")
+				// Re-arma o cap se a resposta trouxer hard_cap_at; falha transitoria de
+				// heartbeat NAO desarma (so o fim real limpa) — evita perder o corte.
+				if hc := postEvent("heartbeat"); !hc.IsZero() {
+					t.hardCapUntil = hc
+				}
 			}
 		case <-presT.C:
 			// Durante a carencia (§3.1) a sessao ainda nao terminou de fato -> nao

@@ -30,6 +30,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 const (
@@ -211,6 +214,51 @@ func rotateOnBoot() {
 	}
 	logln("ROTATE boot: rotacionando senha no startup (fecha 'senha sobrevive ao reboot')")
 	rotateNow()
+}
+
+// clientServiceName: o servico Windows do cliente branded (o RustDesk server que
+// RECEBE as conexoes). Distinto do agente (serviceName = "AcessoFastAgent" em main.go).
+const clientServiceName = "AcessoFast"
+
+// restartClientService reinicia o servico do cliente branded. Billing B2: e o corte
+// DURO do free — parar o servico derruba a sessao ativa; ao subir, o cliente recarrega
+// a config com a senha JA rotacionada. Roda como SYSTEM (o agente e servico), entao tem
+// privilegio pra controlar o SCM. Bounded: espera ate ~20s pelo estado Stopped.
+func restartClientService() {
+	m, err := mgr.Connect()
+	if err != nil {
+		logln("CUT: mgr.Connect falhou: %v", err)
+		return
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(clientServiceName)
+	if err != nil {
+		logln("CUT: OpenService(%s) falhou: %v", clientServiceName, err)
+		return
+	}
+	defer s.Close()
+
+	status, err := s.Control(svc.Stop)
+	if err != nil {
+		// Ja parado, ou sem controle: loga e ainda tenta subir (idempotente).
+		logln("CUT: Stop(%s) falhou: %v (tentando start assim mesmo)", clientServiceName, err)
+	} else {
+		deadline := time.Now().Add(20 * time.Second)
+		for status.State != svc.Stopped && time.Now().Before(deadline) {
+			time.Sleep(500 * time.Millisecond)
+			if status, err = s.Query(); err != nil {
+				logln("CUT: Query(%s) falhou: %v", clientServiceName, err)
+				break
+			}
+		}
+	}
+
+	if err := s.Start(); err != nil {
+		logln("CUT: Start(%s) falhou: %v", clientServiceName, err)
+		return
+	}
+	logln("CUT: servico %s reiniciado — sessao derrubada, senha nova ativa", clientServiceName)
 }
 
 // rotateRetryLoop reenvia a senha pendente ate o painel confirmar. Roda ate stop.
