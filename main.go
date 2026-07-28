@@ -36,7 +36,9 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 // ---------------------------------------------------------------------------
@@ -233,6 +235,43 @@ type tailer struct {
 	// plano/externo). checkHardCap() corta ao vencer: rotaciona + reinicia o cliente
 	// (derruba a sessao). Limpo no fim real da sessao pra nao vazar pro proximo atendimento.
 	hardCapUntil time.Time
+
+	// clientStart: horario de inicio do processo do servico do cliente branded. Muda
+	// quando o cliente REINICIA (reboot/crash/restart manual/corte) — sinal de que TODAS
+	// as conexoes cairam. O restart derruba a sessao SEM emitir "#N closed" no log, entao
+	// sem isto o #N ficava preso em open e virava FANTASMA. Ver detectClientRestart().
+	clientStart time.Time
+}
+
+// clientProcStartTime devolve o horario de inicio do processo do servico do cliente
+// branded (AcessoFast). Fonte FORA do log — o log nao distingue restart (conexoes
+// cairam) de rotacao benigna (conexoes seguem). (time.Time{}, false) se indisponivel
+// (servico parado, sem permissao): nesse caso o detector nao age.
+func clientProcStartTime() (time.Time, bool) {
+	m, err := mgr.Connect()
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(clientServiceName)
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer s.Close()
+	st, err := s.Query()
+	if err != nil || st.ProcessId == 0 {
+		return time.Time{}, false
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, st.ProcessId)
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer windows.CloseHandle(h)
+	var cre, exi, ker, usr windows.Filetime
+	if err := windows.GetProcessTimes(h, &cre, &exi, &ker, &usr); err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, cre.Nanoseconds()), true
 }
 
 func (t *tailer) processLine(line string) {
@@ -350,6 +389,29 @@ func (t *tailer) expireStale() {
 }
 
 func (t *tailer) poll() {
+	// Restart do cliente (reboot/crash/restart manual/corte): o processo do servico troca
+	// de horario de inicio -> TODAS as conexoes cairam, e o "#N closed" NAO e logado num
+	// force-stop. Sem tratar isto, o #N fica preso em t.open e a sessao vira FANTASMA
+	// (heartbeat eterno; connection_logs 'active' pra sempre; painel "em andamento"; o cron
+	// de 90s nunca fecha porque o heartbeat esta fresco). Detecta pelo start-time do
+	// processo (sinal fora do log, que sozinho nao distingue restart de rotacao benigna) e
+	// encerra a sessao. Se o peer ja reconectou, o prime abaixo abre uma sessao nova.
+	if st, ok := clientProcStartTime(); ok {
+		if !t.clientStart.IsZero() && st.After(t.clientStart) {
+			if len(t.open) > 0 {
+				logln("cliente reiniciou (%s -> %s) — conexoes cairam sem 'closed'; encerrando sessao",
+					t.clientStart.Format("15:04:05"), st.Format("15:04:05"))
+				t.open = make(map[string]time.Time)
+				t.graceUntil = time.Time{}
+				t.hardCapUntil = time.Time{}
+				postEvent("end")
+			}
+			t.primed = false // re-prima do log novo
+			t.offset = 0
+		}
+		t.clientStart = st
+	}
+
 	p := findRustdeskLog()
 	if p == "" {
 		return
