@@ -82,9 +82,10 @@ env:
   brandingEnabled: "true"         # aplica icone/logo de ./branding/ do repo
 
   # ---------------- custom_.txt: a identidade do cliente ----------------------
-  # base64 de: {"app-name":"AcessoFast","override-settings":{"approve-mode":"password","allow-remote-config-modification":"N","allow-logon-screen-password":"Y"}}
-  # Fase 3 base (§4.1): approve-mode=password (exige senha, fecha o bypass do "Aceitar"/#5)
-  # e allow-remote-config-modification=N (impede reconfigurar o device por dentro da sessao/#4).
+  # base64 de: {"app-name":"AcessoFast","override-settings":{"approve-mode":"password-click","allow-remote-config-modification":"N","allow-logon-screen-password":"Y"}}
+  # approve-mode=password-click (senha OU aceite): reativa o "aceite do cliente" no endpoint,
+  # mantendo allow-remote-config-modification=N (fecha #4). Reverte a Fase 3 que tinha posto
+  # 'password' (fechava #5) — decisao 28/07, validada no canary 51200651 (flip local, teste a/b OK).
   # Validado no canary via flip local do custom_.txt (device 51200651) antes de assar aqui.
   #
   # 'app-name' define config::APP_NAME em runtime. Sem isso APP_NAME fica "RustDesk" e:
@@ -98,7 +99,7 @@ env:
   # Provado em hbb_common/src/config.rs: approve-mode (:2933) e
   # allow-remote-config-modification (:2915) em KEYS_SETTINGS;
   # allow-logon-screen-password (:3001) em KEYS_BUILDIN_SETTINGS.
-  custom: "eyJhcHAtbmFtZSI6IkFjZXNzb0Zhc3QiLCJvdmVycmlkZS1zZXR0aW5ncyI6eyJhcHByb3ZlLW1vZGUiOiJwYXNzd29yZCIsImFsbG93LXJlbW90ZS1jb25maWctbW9kaWZpY2F0aW9uIjoiTiIsImFsbG93LWxvZ29uLXNjcmVlbi1wYXNzd29yZCI6IlkifX0="
+  custom: "eyJhcHAtbmFtZSI6IkFjZXNzb0Zhc3QiLCJvdmVycmlkZS1zZXR0aW5ncyI6eyJhcHByb3ZlLW1vZGUiOiJwYXNzd29yZC1jbGljayIsImFsbG93LXJlbW90ZS1jb25maWctbW9kaWZpY2F0aW9uIjoiTiIsImFsbG93LWxvZ29uLXNjcmVlbi1wYXNzd29yZCI6IlkifX0="
   runasadmin: "false"
   cycleMonitor: "false"
   delayFix: "false"
@@ -345,6 +346,30 @@ jobs:
           sed -i -e 's|https://admin.rustdesk.com|${{ env.apiServer }}|' ./src/common.rs
           # ./flutter/pubspec.yaml
           #sed -i '/intl:/a \ \ archive: ^3.6.1' ./flutter/pubspec.yaml
+
+      # AcessoFast (auto-adocao): loga o rustdesk_id do PEER (controlador) no log do
+      # servidor, junto do #N. O log padrao do RustDesk (on_open) so tem o IP; o id do
+      # peer (lr.my_id) so existe APOS o LoginRequest -> injetamos em
+      # handle_login_request_without_validation, logo apos `self.lr = lr.clone();`.
+      # O agente parseia `#<N> peer_id <id>` e manda controller_rustdesk_id no 'start'
+      # -> o servidor (auto_adopt_direct) auto-adota o device do cliente no tenant do
+      # controlador. Guarda aborta se o RustDesk mudar a ancora; idempotente.
+      - name: log peer_id no connection.rs (auto-adocao AcessoFast)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./src/server/connection.rs
+          anchor='self.lr = lr.clone();'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora '$anchor' nao encontrada em $f — RustDesk mudou; revisar o patch de peer_id."
+            exit 1
+          fi
+          if grep -qF 'peer_id {}' "$f"; then
+            echo "peer_id ja presente, pulando."
+          else
+            sed -i -e 's|self.lr = lr.clone();|self.lr = lr.clone();\n        log::info!("#{} peer_id {}", self.inner.id, lr.my_id);|' "$f"
+          fi
+          echo "resultado do patch (grep peer_id):"; grep -n 'peer_id' "$f"
 
       - name: allow custom.txt
         uses: nick-fields/retry@v3
