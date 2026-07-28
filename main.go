@@ -297,20 +297,34 @@ func (t *tailer) checkGrace() {
 	}
 }
 
-// checkHardCap (Billing B2): corte rigido de 2h do free. Chamado a cada tick do poll.
-// Ao vencer hardCapUntil com sessao ainda aberta: desarma, rotaciona a senha (mata a
-// que o tecnico viu) e reinicia o cliente branded (derruba a conexao ativa). O fim
-// natural (log fecha -> carencia -> end) fecha a sessao no banco em seguida.
+// checkHardCap (Billing B2/B6): corte rigido. Chamado a cada tick do poll. Cobre
+// tres gatilhos, todos via hard_cap_at da session-ingest: cap de 2h do free, sem
+// saldo (free+credito zerados) e teto de simultaneas por tenant (B6) — nos dois
+// ultimos o servidor manda hard_cap = agora. Ao vencer com sessao aberta: desarma,
+// ENCERRA a sessao (ver abaixo), rotaciona a senha e reinicia o cliente branded.
 func (t *tailer) checkHardCap() {
 	if t.hardCapUntil.IsZero() || len(t.open) == 0 {
 		return
 	}
 	if time.Now().After(t.hardCapUntil) {
 		t.hardCapUntil = time.Time{} // desarma ANTES de agir -> nao corta de novo no proximo tick
-		logln("<<< CORTE 2h (free): limite atingido — rotacionando senha e derrubando a sessao")
+		logln("<<< CORTE (limite): rotacionando senha e derrubando a sessao (abertas: %d)", len(t.open))
+
+		// A sessao acaba AGORA por corte administrativo. O force-stop do servico do
+		// cliente NAO emite "#N Connection closed" no log -> os #N ficam presos em
+		// t.open, o heartbeat continua e o connection_logs vira FANTASMA (ativo ate
+		// expireStale/24h), alem de re-disparar o corte a cada heartbeat (rotate/
+		// restart em loop). Por isso tratamos como fim REAL: esvazia o conjunto,
+		// cancela a carencia e encerra a sessao no banco (end) ANTES de derrubar. Sem
+		// #N aberto nao ha reconexao legitima a esperar (a conexao apos o restart
+		// nasce como sessao nova, que a session-ingest re-avalia e re-corta se preciso).
+		t.open = make(map[string]time.Time)
+		t.graceUntil = time.Time{}
+		postEvent("end")
+
 		go func() {
-			rotateNow()             // 1) nova senha no endpoint (a vista morre)
-			restartClientService()  // 2) reinicia o cliente -> a conexao ativa cai
+			rotateNow()            // 1) nova senha no endpoint (a vista morre)
+			restartClientService() // 2) reinicia o cliente -> a conexao ativa cai
 		}()
 	}
 }
