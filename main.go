@@ -77,7 +77,10 @@ var (
 	//   #619 Connection closed: Peer close
 	openedRe = regexp.MustCompile(`#(\d+) Connection opened`)
 	closedRe = regexp.MustCompile(`#(\d+) Connection closed`)
-	diagRe   = regexp.MustCompile(`(?i)Connection opened|Connection closed|new client|LoginRequest|authorized`)
+	// AcessoFast (auto-adocao): linha injetada no cliente logando o rustdesk_id do peer
+	// (controlador) apos o login: `#<N> peer_id <id>`. Ver o patch no build-client.yml.
+	peerIdRe = regexp.MustCompile(`#(\d+) peer_id (\d+)`)
+	diagRe   = regexp.MustCompile(`(?i)Connection opened|Connection closed|new client|LoginRequest|authorized|peer_id`)
 
 	logMu sync.Mutex
 	logFH *os.File
@@ -175,16 +178,23 @@ type ingestResp struct {
 
 // postEvent posta um evento de sessao e devolve o hard_cap_at da resposta (zero se
 // ausente/ilegivel/erro). So start/heartbeat carregam cap; end/presence retornam zero.
-func postEvent(event string) time.Time {
+func postEvent(event string, controllerID string) time.Time {
 	// Guarda: sem credencial, nao adianta postar — a session-ingest rejeitaria.
 	// Evita ruido de POST invalido a cada 60s quando a matricula ainda nao rodou.
 	if token == "" || rustdeskID == "" {
 		logln("SKIP %s: token/rustdesk_id ausente (matricula pendente?)", event)
 		return time.Time{}
 	}
-	payload, _ := json.Marshal(map[string]string{
+	m := map[string]string{
 		"rustdesk_id": rustdeskID, "agent_token": token, "event": event,
-	})
+	}
+	// controller_rustdesk_id (auto-adocao): rustdesk_id do peer (controlador), quando
+	// conhecido. So no 'start' serve de gatilho pro servidor auto-adotar um device ainda
+	// nao registrado no tenant do controlador; nos demais eventos e ignorado.
+	if controllerID != "" {
+		m["controller_rustdesk_id"] = controllerID
+	}
+	payload, _ := json.Marshal(m)
 	req, err := http.NewRequest("POST", ingestURL, bytes.NewReader(payload))
 	if err != nil {
 		logln("POST %s erro ao montar req: %v", event, err)
@@ -241,6 +251,14 @@ type tailer struct {
 	// as conexoes cairam. O restart derruba a sessao SEM emitir "#N closed" no log, entao
 	// sem isto o #N ficava preso em open e virava FANTASMA. Ver detectClientRestart().
 	clientStart time.Time
+
+	// controllerID (auto-adocao): rustdesk_id do PEER (controlador = maquina do tecnico)
+	// da sessao atual, parseado da linha `#<N> peer_id <id>` que o cliente loga apos o
+	// login. Enviado no 'start' -> o servidor auto-adota um device ainda nao registrado
+	// no tenant do controlador. Vem DEPOIS do "opened" (o login e posterior ao accept TCP),
+	// por isso o start inicial vai sem ele e re-postamos start ao aprender o peer_id.
+	// Limpo no fim real da sessao (nao vaza pro proximo atendimento).
+	controllerID string
 }
 
 // clientProcStartTime devolve o horario de inicio do processo do servico do cliente
@@ -293,11 +311,28 @@ func (t *tailer) processLine(line string) {
 					logln(">>> reconexao dentro da carencia — mesma sessao (start/rotacao suprimidos)")
 				} else {
 					logln(">>> SESSAO INICIADA")
-					if hc := postEvent("start"); !hc.IsZero() {
+					// controllerID ainda vazio aqui (o peer_id vem apos o login); o
+					// re-post no ramo peerIdRe leva o controlador quando ele chegar.
+					if hc := postEvent("start", t.controllerID); !hc.IsZero() {
 						t.hardCapUntil = hc
 						logln(">>> corte de 2h (free) armado para %s", hc.Format(time.RFC3339))
 					}
 				}
+			}
+		}
+		return
+	}
+	// peer_id: rustdesk_id do controlador desta conexao (auto-adocao). Chega apos o login,
+	// depois do "opened". Se o #N esta aberto e ainda nao sabiamos o controlador da sessao,
+	// guarda e RE-POSTA start com o controlador -> gatilho da auto-adocao no servidor
+	// (idempotente p/ device ja adotado: a session-ingest so trata start c/ device ausente).
+	if m := peerIdRe.FindStringSubmatch(line); m != nil {
+		id, peer := m[1], m[2]
+		if _, open := t.open[id]; open && t.controllerID == "" {
+			t.controllerID = peer
+			logln(">>> peer_id do #%s = %s (controlador) — reenviando start com controlador", id, peer)
+			if hc := postEvent("start", t.controllerID); !hc.IsZero() {
+				t.hardCapUntil = hc
 			}
 		}
 		return
@@ -328,8 +363,9 @@ func (t *tailer) checkGrace() {
 	if time.Now().After(t.graceUntil) {
 		t.graceUntil = time.Time{}
 		t.hardCapUntil = time.Time{} // fim real -> desarma o cap 2h (nao vaza pro proximo atendimento)
+		t.controllerID = ""          // fim real -> esquece o controlador desta sessao
 		logln("<<< carencia expirou sem reconexao — SESSAO ENCERRADA")
-		postEvent("end")
+		postEvent("end", "")
 		// Fase 2: gira a senha efemera so agora, no fim REAL da sessao. Em goroutine —
 		// faz exec (--password) + HTTP e nao pode bloquear o poll de deteccao.
 		go rotateNow()
@@ -359,7 +395,8 @@ func (t *tailer) checkHardCap() {
 		// nasce como sessao nova, que a session-ingest re-avalia e re-corta se preciso).
 		t.open = make(map[string]time.Time)
 		t.graceUntil = time.Time{}
-		postEvent("end")
+		t.controllerID = ""
+		postEvent("end", "")
 
 		go func() {
 			rotateNow()            // 1) nova senha no endpoint (a vista morre)
@@ -382,7 +419,8 @@ func (t *tailer) expireStale() {
 			logln("WARN conexao #%s expirada (>24h sem 'closed') — forcando fim", id)
 			if len(t.open) == 0 {
 				t.hardCapUntil = time.Time{} // fim forcado -> desarma o cap 2h
-				postEvent("end")
+				t.controllerID = ""
+				postEvent("end", "")
 			}
 		}
 	}
@@ -404,7 +442,8 @@ func (t *tailer) poll() {
 				t.open = make(map[string]time.Time)
 				t.graceUntil = time.Time{}
 				t.hardCapUntil = time.Time{}
-				postEvent("end")
+				t.controllerID = ""
+				postEvent("end", "")
 			}
 			t.primed = false // re-prima do log novo
 			t.offset = 0
@@ -456,7 +495,9 @@ func (t *tailer) poll() {
 		t.primed = true
 		if len(t.open) > 0 {
 			logln("prime: %d conexao(oes) aberta(s) no boot -> enviando start", len(t.open))
-			if hc := postEvent("start"); !hc.IsZero() {
+			// No boot nao sabemos o controlador (o peer_id ficou no log anterior); se ha
+			// sessao ativa aqui, o device ja estava adotado -> start sem controlador basta.
+			if hc := postEvent("start", t.controllerID); !hc.IsZero() {
 				t.hardCapUntil = hc
 				logln(">>> corte de 2h (free) armado para %s", hc.Format(time.RFC3339))
 			}
@@ -524,7 +565,7 @@ func worker(stop <-chan struct{}) {
 			if len(t.open) > 0 {
 				// Re-arma o cap se a resposta trouxer hard_cap_at; falha transitoria de
 				// heartbeat NAO desarma (so o fim real limpa) — evita perder o corte.
-				if hc := postEvent("heartbeat"); !hc.IsZero() {
+				if hc := postEvent("heartbeat", ""); !hc.IsZero() {
 					t.hardCapUntil = hc
 				}
 			}
@@ -532,7 +573,7 @@ func worker(stop <-chan struct{}) {
 			// Durante a carencia (§3.1) a sessao ainda nao terminou de fato -> nao
 			// mandar "presence" (que so vale pra maquina comprovadamente ociosa).
 			if len(t.open) == 0 && t.graceUntil.IsZero() {
-				postEvent("presence")
+				postEvent("presence", "")
 			}
 		}
 	}
