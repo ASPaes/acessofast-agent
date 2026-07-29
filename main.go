@@ -518,15 +518,23 @@ func worker(stop <-chan struct{}) {
 	logln("===== AcessoFast agent iniciado =====")
 	token = readTrim(tokenFile)
 	if token == "" {
-		logln("sem token em %s -> MODO MATRICULA", tokenFile)
-		if !runMatricula(stop) {
+		logln("sem token em %s -> MODO MATRICULA (tailer ativo p/ auto-adocao)", tokenFile)
+		// NAO bloqueia: seta o token PENDENTE (+ rustdeskID) e registra o claim,
+		// depois segue pro loop de sessao com o tailer LIGADO. Assim um acesso
+		// direto pode postar o 'start' com controller_rustdesk_id que dispara a
+		// auto-adocao no servidor. A credencial e persistida por uma goroutine
+		// (claim-status) quando a maquina for adotada — manual (painel) ou direto.
+		// Sem isto havia deadlock: o agente esperava o claim; o claim esperava o
+		// 'start' que so o tailer (desligado) mandaria.
+		if !startMatricula(stop) {
 			logln("===== agent parando (matricula interrompida) =====")
 			return
 		}
-		token = readTrim(tokenFile) // re-le o token ja confirmado
+		// token e rustdeskID ja setados (token pendente) por startMatricula.
+	} else {
+		rustdeskID = discoverRustdeskID()
 	}
 	logln("token carregado (len=%d)", len(token))
-	rustdeskID = discoverRustdeskID()
 	if rustdeskID == "" {
 		logln("ERRO: rustdesk_id nao encontrado (nem %s nem config do cliente)", ridFile)
 	} else {

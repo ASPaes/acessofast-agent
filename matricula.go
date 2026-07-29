@@ -153,8 +153,18 @@ func postClaimStatus(rid, nonce string) string {
 	return out.Status
 }
 
-// runMatricula bloqueia ate a maquina ser adotada. Retorna false se stop veio antes.
-func runMatricula(stop <-chan struct{}) bool {
+// startMatricula NAO bloqueia: descobre o rustdesk_id, seta o token PENDENTE (+
+// rustdeskID) em memoria, registra o claim e sobe a goroutine que finaliza a
+// credencial quando a maquina for adotada. Retorna false so se stop veio antes de
+// o ID existir.
+//
+// Chave da auto-adocao: o token pendente (st.Token) ja tem o hash registrado no
+// claim, entao o agente ja pode postar eventos de sessao ANTES de ser adotado. Num
+// acesso direto, o tailer posta 'start' com controller_rustdesk_id e o servidor
+// (auto_adopt_direct) adota o device pelo hash do token, consumindo o claim. Sem
+// isto havia deadlock: o agente esperava o claim ser consumido pra ligar o tailer,
+// e o claim so seria consumido por um 'start' que so o tailer mandaria.
+func startMatricula(stop <-chan struct{}) bool {
 	rid, ok := waitForRustDeskID(stop)
 	if !ok {
 		return false
@@ -167,13 +177,27 @@ func runMatricula(stop <-chan struct{}) bool {
 	host := machineAlias()
 	osStr := osString()
 
-	postClaimRegister(rid, nonceHash, tokenHash, host, osStr)
-	logln("matricula: aguardando adocao — tecnico adota pelo ID %s no painel", rid)
+	// Token PENDENTE em memoria: habilita postEvent (e a auto-adocao) desde ja. So
+	// vira credencial persistida (agent.token) quando o claim for consumido.
+	token = st.Token
+	rustdeskID = rid
 
+	postClaimRegister(rid, nonceHash, tokenHash, host, osStr)
+	logln("matricula: claim registrado; tailer ativo — adocao pelo painel OU acesso direto")
+
+	go finalizeMatricula(stop, rid, st, nonceHash, tokenHash, host, osStr)
+	return true
+}
+
+// finalizeMatricula acompanha o claim-status e, quando a maquina for adotada
+// (manual no painel OU auto-adocao pelo acesso direto), persiste a credencial. O
+// token persistido e o MESMO ja usado nos eventos de sessao (st.Token), entao a
+// transicao e transparente pro tailer, que segue rodando sem interrupcao.
+func finalizeMatricula(stop <-chan struct{}, rid string, st enrollState, nonceHash, tokenHash, host, osStr string) {
 	for {
 		select {
 		case <-stop:
-			return false
+			return
 		case <-time.After(claimPollInterval):
 		}
 
@@ -185,10 +209,10 @@ func runMatricula(stop <-chan struct{}) bool {
 				continue
 			}
 			_ = os.Remove(enrollStateFile)
-			logln("matricula: APROVADO — token gravado, virando modo sessao")
-			return true
+			logln("matricula: ADOTADO — credencial persistida; matricula concluida")
+			return
 		case "waiting":
-			// segue esperando
+			// segue esperando (o tailer ja esta ativo com o token pendente)
 		case "expired", "rejected", "unknown":
 			logln("matricula: pedido morto/sumido -> re-registrando")
 			postClaimRegister(rid, nonceHash, tokenHash, host, osStr)
