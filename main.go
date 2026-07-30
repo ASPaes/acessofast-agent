@@ -484,22 +484,36 @@ func (t *tailer) poll() {
 	if !t.primed {
 		// Reconstrucao de estado no boot: reproduz opened/closed do arquivo
 		// atual SEM postar eventos historicos. Se sobrar #N aberto, ha sessao
-		// ativa agora -> um unico "start".
+		// ativa agora -> um unico "start". Tambem parseia peer_id: se a linha do
+		// controlador da conexao ainda-aberta esta NESTE log, aprende o controlador
+		// aqui pra o start do prime ja o levar.
 		for _, ln := range lines {
 			if m := openedRe.FindStringSubmatch(ln); m != nil {
 				t.open[m[1]] = time.Now()
 			} else if m := closedRe.FindStringSubmatch(ln); m != nil {
 				delete(t.open, m[1])
+			} else if m := peerIdRe.FindStringSubmatch(ln); m != nil {
+				// SEGURANCA: guarda o controlador de uma conexao ainda ABERTA no boot.
+				// Sem isto, uma sessao capturada pelo prime (reconexao do invasor DURANTE
+				// o restart do corte) ia sem controller_rustdesk_id -> so 404, nunca 403
+				// unknown_controller -> ESCAPAVA do corte por ~20-44s (visto em teste real).
+				// Com o controlador, o start do prime dispara o 403 -> corte em ~3s. A
+				// ultima linha peer_id de um #N aberto vence (sessao corrente).
+				if _, open := t.open[m[1]]; open {
+					t.controllerID = m[2]
+				}
 			}
 		}
 		t.primed = true
 		if len(t.open) > 0 {
-			logln("prime: %d conexao(oes) aberta(s) no boot -> enviando start", len(t.open))
-			// No boot nao sabemos o controlador (o peer_id ficou no log anterior); se ha
-			// sessao ativa aqui, o device ja estava adotado -> start sem controlador basta.
+			logln("prime: %d conexao(oes) aberta(s) no boot -> enviando start (controlador=%q)", len(t.open), t.controllerID)
+			// Se aprendemos o controlador da sessao aberta (linha peer_id no log atual), o
+			// start ja o leva -> auto-adocao (device novo legitimo) OU corte (controlador nao
+			// adotado). Sem peer_id no log (device ja adotado, reboot comum) segue sem
+			// controlador, que basta (o servidor ignora o controlador p/ device ja adotado).
 			if hc := postEvent("start", t.controllerID); !hc.IsZero() {
 				t.hardCapUntil = hc
-				logln(">>> corte de 2h (free) armado para %s", hc.Format(time.RFC3339))
+				logln(">>> corte armado para %s", hc.Format(time.RFC3339))
 			}
 		} else {
 			logln("prime: sem sessao ativa no boot")
