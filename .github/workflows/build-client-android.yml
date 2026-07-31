@@ -490,6 +490,60 @@ jobs:
           fi
           echo "strings Android branded."
 
+      # O AcessoFast NAO mostra o aviso "SCAM" do RustDesk. O dialogo so aparece
+      # quando gFFI.userModel.userName esta vazio — e o cliente AcessoFast NUNCA
+      # faz login, entao ele aparecia TODA vez que o cliente ia ligar o servico.
+      # No nosso fluxo (adocao pelo painel, senha servida pelo painel) ele nao faz
+      # sentido e ainda assusta o cliente. Neutralizamos showScamWarning para so
+      # ligar o servico direto, sem dialogo. Mesmo padrao de âncora do
+      # load_custom_client (injeta corpo + return). O showDialog que sobra vira
+      # dead-code, que e um lint do analyzer e NAO falha o `flutter build`.
+      - name: Remover aviso de golpe (scam warning)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/lib/mobile/pages/server_page.dart
+          anchor='void showScamWarning(BuildContext context, ServerModel serverModel) {'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora do showScamWarning nao encontrada em $f — RustDesk mudou o server_page.dart."
+            exit 1
+          fi
+          if grep -qF 'AcessoFast: sem aviso de golpe' "$f"; then
+            echo "ja neutralizado, pulando."
+          else
+            sed -i -e 's|void showScamWarning(BuildContext context, ServerModel serverModel) {|void showScamWarning(BuildContext context, ServerModel serverModel) {\n  // AcessoFast: sem aviso de golpe — liga o servico direto, sem o dialogo.\n  serverModel.toggleService();\n  return;|' "$f"
+          fi
+          echo "--- resultado ---"
+          grep -n -A 3 'void showScamWarning' "$f"
+          if ! grep -qF 'AcessoFast: sem aviso de golpe' "$f"; then
+            echo "::error::patch do scam warning nao aplicou."
+            exit 1
+          fi
+
+      # Remove o icone flutuante (overlay preto-e-branco tipo RustDesk) que
+      # aparecia com o app em segundo plano (FloatingWindowService). E inutil no
+      # AcessoFast e o cliente reclamou. onStop() so inicia esse servico quando
+      # disableFloatingWindow == false; forcamos true. De quebra, o app deixa de
+      # pedir a permissao de "sobrepor a outros apps" (ver toggleService no
+      # server_model, que so pede o overlay quando a opcao != 'Y').
+      - name: Desabilitar janela flutuante (floating window)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainActivity.kt
+          anchor='val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora do disableFloatingWindow nao encontrada em $f — RustDesk mudou o MainActivity.kt."
+            exit 1
+          fi
+          sed -i -e 's|val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"|val disableFloatingWindow = true // AcessoFast: sem janela flutuante|' "$f"
+          echo "--- resultado ---"
+          grep -n 'disableFloatingWindow' "$f"
+          if grep -qF 'FFI.getLocalOption("disable-floating-window")' "$f"; then
+            echo "::error::patch da janela flutuante nao aplicou — ainda le a opcao."
+            exit 1
+          fi
+
       - name: removeNewVersionNotif
         continue-on-error: true
         shell: bash
