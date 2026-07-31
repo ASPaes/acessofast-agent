@@ -435,6 +435,10 @@ jobs:
         with:
           prefix-key: acessofast-android
           key: ${{ matrix.job.target }}
+          # Default e false: cache só é salvo quando o job passa. Como as falhas
+          # tendem a ser no fim (Gradle/APK), sem isto cada tentativa recompila
+          # o Rust inteiro do zero. Salvar em falha e o que torna a iteracao viavel.
+          cache-on-failure: true
 
       - name: Build rustdesk lib
         env:
@@ -460,11 +464,31 @@ jobs:
           SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          echo -n "$SIGNING_KEY" | base64 -d > ./flutter/android/acessofast-upload.jks
+          # CAMINHO ABSOLUTO, de proposito. key.properties e lido de
+          # rootProject (flutter/android/), MAS o `file(storeFile)` do
+          # signingConfigs e avaliado no modulo app/ — um caminho relativo
+          # resolveria pra flutter/android/app/ e o Gradle nao acharia o
+          # keystore. Foi exatamente o que quebrou o run #1 (assembleRelease
+          # exit 1). Absoluto elimina a ambiguidade de contexto.
+          KEYSTORE_PATH="$GITHUB_WORKSPACE/flutter/android/acessofast-upload.jks"
+          echo -n "$SIGNING_KEY" | base64 -d > "$KEYSTORE_PATH"
           # nada de echo do conteudo: so o tamanho, pra diagnostico
-          echo "keystore decodificado: $(wc -c < ./flutter/android/acessofast-upload.jks) bytes"
+          echo "keystore decodificado: $(wc -c < "$KEYSTORE_PATH") bytes em $KEYSTORE_PATH"
+
+          # Valida o keystore ANTES do Gradle. Pega os 3 erros mais provaveis de
+          # secret (base64 corrompido, storePassword errada, alias inexistente)
+          # em ~2s, em vez de depois de todo o build. keytool -list nao imprime
+          # segredo: so alias e fingerprint do certificado.
+          if ! keytool -list -keystore "$KEYSTORE_PATH" \
+                 -storepass "$SIGNING_STORE_PASSWORD" -alias "$SIGNING_ALIAS" > /dev/null 2>&1; then
+            echo "::error::keystore invalido, storePassword errada ou alias '$SIGNING_ALIAS' inexistente."
+            echo "::error::Confira os secrets ANDROID_SIGNING_KEY / _STORE_PASSWORD / _ALIAS."
+            exit 1
+          fi
+          echo "keystore validado (alias '$SIGNING_ALIAS' encontrado)."
+
           cat > ./flutter/android/key.properties <<EOF
-          storeFile=acessofast-upload.jks
+          storeFile=$KEYSTORE_PATH
           storePassword=$SIGNING_STORE_PASSWORD
           keyAlias=$SIGNING_ALIAS
           keyPassword=$SIGNING_KEY_PASSWORD
