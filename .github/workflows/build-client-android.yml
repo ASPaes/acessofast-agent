@@ -1,0 +1,509 @@
+name: Build AcessoFast Client (Android)
+run-name: "AcessoFast Android — RustDesk ${{ inputs.version }}"
+
+# Irmao do build-client.yml (Windows). Ficou em arquivo SEPARADO de proposito:
+#   - o build Windows ja funciona e nao deve ser tocado por trabalho de Android
+#   - ajustar o Android nao paga os ~48min do job Windows a cada iteracao
+# Reaproveita o bridge.yml (mesmo artefato de bridge que o Windows usa).
+#
+# ============================================================================
+# O QUE E DIFERENTE DO WINDOWS (leia antes de mexer)
+# ============================================================================
+#
+# 1) O custom_.txt NAO EXISTE NO ANDROID.
+#    No Windows a identidade entra por um arquivo gravado AO LADO do .exe, lido
+#    em runtime (src/common.rs: load_custom_client -> std::fs::read_to_string do
+#    diretorio do executavel). Um APK e um pacote selado: nao ha "pasta do
+#    executavel" onde largar sidecar. Copiar o step do Windows aqui resultaria
+#    num app identificado como "RustDesk", lendo o namespace errado.
+#
+#    O RustDesk ja tem o caminho certo pro Flutter, e ele e explicito no fonte:
+#      flutter/android/.../MainService.kt : FFI.startServer(configPath, "")
+#      src/flutter_ffi.rs                 : if custom_client_config.is_empty()
+#                                             { load_custom_client() }
+#                                           else { read_custom_client(cfg) }
+#    Ou seja: o 2o argumento do startServer E o canal oficial. O upstream passa
+#    string vazia. Nos passamos o base64 (step 'injetar identidade').
+#
+# 2) O patch allowCustom.py CONTINUA NECESSARIO — e por um motivo nao obvio.
+#    A verificacao RSA (const KEY 5Qbwsde3un... + get_rs_pk + sign::verify) esta
+#    DENTRO de read_custom_client, que e exatamente a funcao que o caminho do
+#    Kotlin chama. Sem o patch, o nosso base64 nao-assinado e RECUSADO.
+#    E o pior: recusa em SILENCIO (so um log::error e `return`) — o build sai
+#    verde e entrega um APK "RustDesk". Por isso o step de sanidade abaixo
+#    FALHA O BUILD em vez de avisar.
+#
+# 3) Assinatura: o upstream do RustDesk troca signingConfigs.release por .debug
+#    ("temporary use debug sign config"). NAO seguimos isso. Um APK debug-signed
+#    nao atualiza por cima de um release-signed depois — prenderia a base
+#    instalada. Assinamos release de verdade, via secrets.
+#
+# ============================================================================
+# REQUISITOS (o build aborta em ~10s se faltarem)
+# ============================================================================
+#   - repo VARIABLES: RELAY_HOST, RELAY_PUBKEY  (aba Variables, nao Secrets)
+#   - repo SECRETS:   ANDROID_SIGNING_KEY (base64 do .jks),
+#                     ANDROID_SIGNING_ALIAS,
+#                     ANDROID_SIGNING_STORE_PASSWORD,
+#                     ANDROID_SIGNING_KEY_PASSWORD
+#   - branding/icon.png (quadrado, >=192px)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag do RustDesk a buildar (ex: 1.4.9)'
+        required: true
+        default: '1.4.9'
+        type: string
+
+env:
+  RUST_VERSION: "1.75"
+  CARGO_NDK_VERSION: "3.1.2"
+  ANDROID_FLUTTER_VERSION: "3.24.5"
+  NDK_VERSION: "r28c"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "${{ inputs.version }}"
+
+  # ---------------- Identidade AcessoFast (igual ao build Windows) ------------
+  appname: "AcessoFast"
+  compname: "ASP Softwares"
+
+  # applicationId do APK. TROCADO de propósito: o upstream usa
+  # com.carriez.flutter_hbb, que (a) colide com o RustDesk oficial no mesmo
+  # aparelho e (b) nao poderia ser publicado como app nosso na Play Store.
+  # O sufixo '.mobile' e escolha do Ryan (2026-07-31), pra identificacao — nao ha
+  # necessidade tecnica, ja que o client desktop nao tem applicationId.
+  # ATENCAO: depois de publicado, applicationId NUNCA MAIS MUDA. Confirmar antes
+  # do primeiro APK que sair pra cliente.
+  applicationId: "br.com.aspsoftwares.acessofast.mobile"
+
+  # ---------------- Plano de dados: relay proprio -----------------------------
+  server: "${{ vars.RELAY_HOST }}"
+  key: "${{ vars.RELAY_PUBKEY }}"
+  apiServer: ""
+
+  # ---------------- Identidade injetada no MainService.kt ---------------------
+  # MESMO base64 do build-client.yml (Windows) — os dois clientes tem que
+  # concordar em app-name e override-settings, senao o parque fica com duas
+  # politicas diferentes. Se mudar la, mude aqui.
+  # Decodifica para:
+  # {"app-name":"AcessoFast","override-settings":{"approve-mode":"password-click",
+  #  "allow-remote-config-modification":"N","allow-logon-screen-password":"Y"}}
+  custom: "eyJhcHAtbmFtZSI6IkFjZXNzb0Zhc3QiLCJvdmVycmlkZS1zZXR0aW5ncyI6eyJhcHByb3ZlLW1vZGUiOiJwYXNzd29yZC1jbGljayIsImFsbG93LXJlbW90ZS1jb25maWctbW9kaWZpY2F0aW9uIjoiTiIsImFsbG93LWxvZ29uLXNjcmVlbi1wYXNzd29yZCI6IlkifX0="
+
+jobs:
+  # Mesmo guard do build Windows: sem as vars o sed do config.rs troca o relay
+  # por string VAZIA, o build fica verde e entrega um cliente que nao conecta
+  # em lugar nenhum. Custa ~10s e aborta antes dos ~40min.
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Vars obrigatorias (RELAY_HOST / RELAY_PUBKEY)
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          if [ -z "${{ vars.RELAY_HOST }}" ]; then
+            echo "::error::vars.RELAY_HOST vazio (aba Variables, nao Secrets)."; fail=1
+          fi
+          if [ -z "${{ vars.RELAY_PUBKEY }}" ]; then
+            echo "::error::vars.RELAY_PUBKEY vazio (aba Variables, nao Secrets)."; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "relay ok."
+
+      - name: Secrets de assinatura obrigatorios
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          [ -n "${{ secrets.ANDROID_SIGNING_KEY }}" ]            || { echo "::error::secret ANDROID_SIGNING_KEY ausente."; fail=1; }
+          [ -n "${{ secrets.ANDROID_SIGNING_ALIAS }}" ]          || { echo "::error::secret ANDROID_SIGNING_ALIAS ausente."; fail=1; }
+          [ -n "${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}" ] || { echo "::error::secret ANDROID_SIGNING_STORE_PASSWORD ausente."; fail=1; }
+          [ -n "${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}" ]   || { echo "::error::secret ANDROID_SIGNING_KEY_PASSWORD ausente."; fail=1; }
+          [ "$fail" -eq 0 ] || exit 1
+          echo "secrets de assinatura ok."
+
+      - name: Sanidade do custom (identidade)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ env.custom }}" ]; then
+            echo "::error::env.custom vazio — o APK sairia identificado como RustDesk."
+            exit 1
+          fi
+          echo "custom decodificado:"
+          echo -n "${{ env.custom }}" | base64 -d
+          echo ""
+
+      - name: Branding presente
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -f ./branding/icon.png ] || { echo "::error::branding/icon.png ausente."; exit 1; }
+          echo "branding ok."
+
+  generate-bridge:
+    needs: preflight
+    uses: ./.github/workflows/bridge.yml
+    with:
+      version: ${{ inputs.version }}
+
+  build-for-android:
+    name: Build Android
+    needs: [preflight, generate-bridge]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          # v1: so arm64-v8a. Cobre praticamente todo aparelho de 2017 pra ca e
+          # e 1 ciclo de build em vez de 3. Pra adicionar, descomente — os steps
+          # ja sao parametrizados por matrix.
+          - { arch: aarch64, target: aarch64-linux-android, abi: arm64-v8a, ndk_script: ndk_arm64.sh }
+          # - { arch: armv7,  target: armv7-linux-androideabi, abi: armeabi-v7a, ndk_script: ndk_arm.sh }
+          # - { arch: x86_64, target: x86_64-linux-android,    abi: x86_64,      ndk_script: ndk_x64.sh }
+
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # CRITICO: o checkout de rustdesk/rustdesk (adiante) sobrescreve o
+      # workspace e apagaria ./branding/. Salvamos fora do workspace primeiro.
+      # (mesma razao e mesmo mecanismo do build Windows)
+      - name: Preservar branding fora do workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/af-branding"
+          cp ./branding/icon.png "$RUNNER_TEMP/af-branding/icon.png"
+          echo "AF_BRANDING=$RUNNER_TEMP/af-branding" >> "$GITHUB_ENV"
+          ls -la "$RUNNER_TEMP/af-branding"
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang cmake curl gcc-multilib git g++ g++-multilib \
+               libasound2-dev libc6-dev libclang-dev libunwind-dev \
+               libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+               libgtk-3-dev libpam0g-dev libpulse-dev libva-dev \
+               libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+               libxdo-dev libxfixes-dev llvm-dev nasm ninja-build \
+               openjdk-17-jdk-headless pkg-config tree wget imagemagick
+
+      - name: Checkout source code (tag)
+        if: ${{ env.VERSION != 'master' }}
+        uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: refs/tags/${{ env.VERSION }}
+          submodules: recursive
+
+      - name: Checkout source code (master)
+        if: ${{ env.VERSION == 'master' }}
+        uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          submodules: recursive
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@master
+        with:
+          name: bridge-artifact
+          path: ./
+
+      # ---------------------------------------------------------------------
+      # BRANDING — subconjunto do build Windows que faz sentido em Android.
+      # Ficaram de fora: Runner.rc, libs/portable, res/msi (tudo Windows-only).
+      # ---------------------------------------------------------------------
+      - name: change appname to custom
+        continue-on-error: true
+        shell: bash
+        run: |
+          sed -i -e 's|description = "RustDesk Remote Desktop"|description = "${{ env.appname }}"|' ./Cargo.toml
+          if [ -n "${{ env.compname }}" ]; then
+            find ./src/lang -name "*.rs" -exec sed -i '/powered_by_me/s|RustDesk|${{ env.compname }}|g' {} \;
+          fi
+          find ./src/lang -name "*.rs" -exec sed -i -e 's|RustDesk|${{ env.appname }}|' {} \;
+
+      - name: change company name
+        continue-on-error: true
+        shell: bash
+        run: |
+          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/lib/mobile/pages/settings_page.dart
+          sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./flutter/lib/mobile/pages/settings_page.dart
+
+      # O build Windows ja tocava nestes arquivos mobile — mantido igual.
+      - name: change url and download link
+        continue-on-error: true
+        shell: bash
+        run: |
+          sed -i -e "s|const url = 'https://rustdesk.com/';|const url = '';|" ./flutter/lib/mobile/pages/settings_page.dart
+          sed -i -e 's|https://rustdesk.com/download|#|' ./flutter/lib/mobile/pages/connection_page.dart
+
+      # SOBERANIA: relay proprio hardcoded + admin.rustdesk.com zerado.
+      # Este step e o mais critico do build inteiro: se falhar silenciosamente o
+      # APK nao conecta em lugar nenhum. Por isso NAO tem continue-on-error e
+      # tem verificacao explicita depois.
+      - name: set server, key, and apiserver
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i -e 's|rs-ny.rustdesk.com|${{ env.server }}|' ./libs/hbb_common/src/config.rs
+          sed -i -e 's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${{ env.key }}|' ./libs/hbb_common/src/config.rs
+          sed -i -e 's|https://admin.rustdesk.com|${{ env.apiServer }}|' ./src/common.rs
+          echo "--- verificacao ---"
+          if grep -q 'rs-ny.rustdesk.com' ./libs/hbb_common/src/config.rs; then
+            echo "::error::relay do RustDesk ainda presente no config.rs — o sed nao pegou."
+            exit 1
+          fi
+          if grep -q 'admin.rustdesk.com' ./src/common.rs; then
+            echo "::error::admin.rustdesk.com ainda presente em common.rs."
+            exit 1
+          fi
+          echo "relay/key/apiserver aplicados."
+
+      # AcessoFast (auto-adocao): identico ao build Windows. O agente embutido no
+      # app Android vai parsear a mesma linha, entao o patch tem que existir aqui
+      # tambem — senao o Android nunca auto-adota.
+      - name: log peer_id no connection.rs (auto-adocao AcessoFast)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./src/server/connection.rs
+          anchor='self.lr = lr.clone();'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora '$anchor' nao encontrada em $f — RustDesk mudou; revisar o patch de peer_id."
+            exit 1
+          fi
+          if grep -qF 'peer_id {}' "$f"; then
+            echo "peer_id ja presente, pulando."
+          else
+            sed -i -e 's|self.lr = lr.clone();|self.lr = lr.clone();\n        log::info!("#{} peer_id {}", self.inner.id, lr.my_id);|' "$f"
+          fi
+          grep -n 'peer_id' "$f"
+
+      # SEM ISTO O APK SAI COMO "RustDesk". Ver cabecalho, item (2): a verificacao
+      # RSA vive DENTRO de read_custom_client — a mesma funcao que o caminho do
+      # Kotlin chama — e recusa nosso base64 em silencio.
+      - name: allow custom.txt (remove verificacao RSA do read_custom_client)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o allowCustom.py \
+            https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allowCustom.py
+          python3 allowCustom.py
+          if grep -q '5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=' ./src/common.rs; then
+            echo "::error::a chave RSA do RustDesk continua em common.rs — allowCustom.py nao aplicou."
+            exit 1
+          fi
+          echo "verificacao RSA removida."
+
+      # ---------------------------------------------------------------------
+      # O STEP ESPECIFICO DE ANDROID. Ver cabecalho, item (1).
+      # ---------------------------------------------------------------------
+      - name: Injetar identidade AcessoFast no MainService.kt
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
+          anchor='FFI.startServer(configPath, "")'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora 'FFI.startServer(configPath, \"\")' nao encontrada em $f."
+            echo "::error::O RustDesk mudou o ponto de entrada do Android — revisar antes de seguir."
+            exit 1
+          fi
+          sed -i -e "s|FFI.startServer(configPath, \"\")|FFI.startServer(configPath, \"${{ env.custom }}\")|" "$f"
+          echo "--- resultado ---"
+          grep -n 'FFI.startServer' "$f"
+
+      - name: Sanidade da identidade (FALHA o build se nao entrou)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
+          if grep -qF 'FFI.startServer(configPath, "")' "$f"; then
+            echo "::error::MainService.kt ainda passa string VAZIA — o APK sairia como RustDesk."
+            exit 1
+          fi
+          if ! grep -qF '${{ env.custom }}' "$f"; then
+            echo "::error::o base64 da identidade nao esta no MainService.kt."
+            exit 1
+          fi
+          echo "identidade AcessoFast injetada e conferida."
+
+      # applicationId proprio: sem isto o APK colide com o RustDesk oficial no
+      # mesmo aparelho e nao poderia ir pra Play Store como app nosso.
+      - name: Trocar applicationId
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/android/app/build.gradle
+          if ! grep -qF 'applicationId "com.carriez.flutter_hbb"' "$f"; then
+            echo "::error::applicationId padrao nao encontrado em $f."
+            exit 1
+          fi
+          sed -i -e 's|applicationId "com.carriez.flutter_hbb"|applicationId "${{ env.applicationId }}"|' "$f"
+          grep -n 'applicationId' "$f"
+
+      - name: removeNewVersionNotif
+        continue-on-error: true
+        shell: bash
+        run: |
+          sed -i -e 's|https://api.github.com/repos/rustdesk/rustdesk/releases/latest||' ./src/common.rs
+
+      - name: Icone do launcher (branding)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$AF_BRANDING/icon.png"
+          declare -A d=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
+          for k in "${!d[@]}"; do
+            out="./flutter/android/app/src/main/res/mipmap-$k"
+            mkdir -p "$out"
+            convert "$src" -resize "${d[$k]}x${d[$k]}" "$out/ic_launcher.png"
+          done
+          echo "icones do launcher aplicados."
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{ env.ANDROID_FLUTTER_VERSION }} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff || true
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          if ! ./flutter/build_android_deps.sh "${{ matrix.job.abi }}"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r f; do
+              echo "$f:"; echo "======"; cat "$f"; echo "======"; echo ""
+            done
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: acessofast-android
+          key: ${{ matrix.job.target }}
+
+      - name: Build rustdesk lib
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add ${{ matrix.job.target }}
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          ./flutter/${{ matrix.job.ndk_script }}
+          mkdir -p ./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}
+          cp ./target/${{ matrix.job.target }}/release/liblibrustdesk.so \
+             ./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}/librustdesk.so
+
+      # Assinatura RELEASE de verdade — NAO o signingConfigs.debug do upstream.
+      # O build.gradle do RustDesk le de flutter/android/key.properties
+      # (keyAlias / keyPassword / storeFile / storePassword).
+      - name: Configurar assinatura release
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_ALIAS }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo -n "$SIGNING_KEY" | base64 -d > ./flutter/android/acessofast-upload.jks
+          # nada de echo do conteudo: so o tamanho, pra diagnostico
+          echo "keystore decodificado: $(wc -c < ./flutter/android/acessofast-upload.jks) bytes"
+          cat > ./flutter/android/key.properties <<EOF
+          storeFile=acessofast-upload.jks
+          storePassword=$SIGNING_STORE_PASSWORD
+          keyAlias=$SIGNING_ALIAS
+          keyPassword=$SIGNING_KEY_PASSWORD
+          EOF
+          # Guard: se o upstream mudar e o release sumir, o APK sairia debug-signed.
+          if ! grep -qF 'signingConfig signingConfigs.release' ./flutter/android/app/build.gradle; then
+            echo "::error::build.gradle nao usa signingConfigs.release — APK sairia mal assinado."
+            exit 1
+          fi
+          echo "assinatura release configurada."
+
+      - name: Build APK
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so \
+             ./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}/
+          pushd flutter
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
+          popd
+          mv ./flutter/build/app/outputs/flutter-apk/app-${{ matrix.job.abi }}-release.apk \
+             ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          ls -la ./AcessoFast-*.apk
+
+      - name: Limpar segredos do workspace
+        if: always()
+        shell: bash
+        run: |
+          rm -f ./flutter/android/acessofast-upload.jks ./flutter/android/key.properties
+          echo "keystore e key.properties removidos do workspace."
+
+      - name: Publicar o APK AcessoFast como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: acessofast-android-${{ matrix.job.arch }}
+          path: ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          if-no-files-found: error
