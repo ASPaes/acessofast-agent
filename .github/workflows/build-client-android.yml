@@ -142,12 +142,13 @@ jobs:
           echo -n "${{ env.custom }}" | base64 -d
           echo ""
 
-      - name: Branding presente
+      - name: Branding e agente presentes
         shell: bash
         run: |
           set -euo pipefail
           [ -f ./branding/icon.png ] || { echo "::error::branding/icon.png ausente."; exit 1; }
-          echo "branding ok."
+          [ -f ./mobile/agent.dart ] || { echo "::error::mobile/agent.dart ausente."; exit 1; }
+          echo "branding e agente ok."
 
   generate-bridge:
     needs: preflight
@@ -188,14 +189,18 @@ jobs:
       # CRITICO: o checkout de rustdesk/rustdesk (adiante) sobrescreve o
       # workspace e apagaria ./branding/. Salvamos fora do workspace primeiro.
       # (mesma razao e mesmo mecanismo do build Windows)
-      - name: Preservar branding fora do workspace
+      - name: Preservar branding e agente fora do workspace
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/af-branding"
+          mkdir -p "$RUNNER_TEMP/af-branding" "$RUNNER_TEMP/af-agent"
           cp ./branding/icon.png "$RUNNER_TEMP/af-branding/icon.png"
+          # agent.dart precisa sobreviver ao checkout do rustdesk pelo mesmo
+          # motivo do branding: o checkout sobrescreve o workspace inteiro.
+          cp ./mobile/agent.dart "$RUNNER_TEMP/af-agent/agent.dart"
           echo "AF_BRANDING=$RUNNER_TEMP/af-branding" >> "$GITHUB_ENV"
-          ls -la "$RUNNER_TEMP/af-branding"
+          echo "AF_AGENT=$RUNNER_TEMP/af-agent" >> "$GITHUB_ENV"
+          ls -la "$RUNNER_TEMP/af-branding" "$RUNNER_TEMP/af-agent"
 
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v6
@@ -446,6 +451,43 @@ jobs:
           fi
           echo "manifest branded."
 
+      # Os ultimos "RustDesk" visiveis ao usuario, achados testando o run #4:
+      #   - DEFAULT_NOTIFY_TITLE: titulo da notificacao permanente que fica na
+      #     barra enquanto o compartilhamento roda. E o que o cliente ve o tempo
+      #     todo durante um atendimento.
+      #   - app_name (strings.xml): recurso de nome do app.
+      #   - accessibility_service_description: o texto explicativo em
+      #     Configuracoes > Acessibilidade, na hora de liberar o controle.
+      - name: Branding de strings Android (notificacao e acessibilidade)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ms=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
+          st=./flutter/android/app/src/main/res/values/strings.xml
+
+          if ! grep -qF 'const val DEFAULT_NOTIFY_TITLE = "RustDesk"' "$ms"; then
+            echo "::error::DEFAULT_NOTIFY_TITLE nao encontrado em $ms."
+            exit 1
+          fi
+          sed -i -e 's|const val DEFAULT_NOTIFY_TITLE = "RustDesk"|const val DEFAULT_NOTIFY_TITLE = "${{ env.appname }}"|' "$ms"
+
+          if ! grep -qF '<string name="app_name">RustDesk</string>' "$st"; then
+            echo "::error::app_name nao encontrado em $st."
+            exit 1
+          fi
+          sed -i -e 's|<string name="app_name">RustDesk</string>|<string name="app_name">${{ env.appname }}</string>|' "$st"
+          # descricao do servico de acessibilidade (cita "RustDesk" no meio da frase)
+          sed -i -e 's|when RustDesk screen sharing|when ${{ env.appname }} screen sharing|' "$st"
+
+          echo "--- resultado ---"
+          cat "$st"
+          grep -n 'DEFAULT_NOTIFY_TITLE' "$ms"
+          if grep -q 'RustDesk' "$st"; then
+            echo "::error::ainda ha 'RustDesk' em strings.xml."
+            exit 1
+          fi
+          echo "strings Android branded."
+
       - name: removeNewVersionNotif
         continue-on-error: true
         shell: bash
@@ -494,6 +536,71 @@ jobs:
             echo "::error::ic_launcher.png nao foi gerado."; exit 1; }
           echo "icones do launcher aplicados:"
           ls -la "$res/mipmap-xxxhdpi/"
+
+      # ---------------------------------------------------------------------
+      # AGENTE EMBUTIDO (etapa 5 do MOBILE-DESIGN.md) — matricula por nonce.
+      # Porte do matricula.go. Mesmos endpoints do agente Windows, nenhuma edge
+      # function nova.
+      #
+      # Vem como ARQUIVO NOVO (mobile/agent.dart -> flutter/lib/acessofast/) em
+      # vez de sed espalhado: o build parte de uma TAG do rustdesk/rustdesk, e
+      # patch por sed quebra a cada upgrade. Assim so dependemos de duas
+      # ancoras no main.dart, ambas verificadas abaixo.
+      - name: Instalar o agente AcessoFast (agent.dart)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ./flutter/lib/acessofast
+          cp "$AF_AGENT/agent.dart" ./flutter/lib/acessofast/agent.dart
+          echo "agent.dart instalado ($(wc -l < ./flutter/lib/acessofast/agent.dart) linhas)"
+
+          # O agente usa sha256 (protocolo do claim) e o RustDesk nao declara o
+          # pacote crypto. E pure-Dart, do time do Dart, sem codigo nativo.
+          p=./flutter/pubspec.yaml
+          if grep -qE '^\s+crypto:' "$p"; then
+            echo "crypto ja declarado."
+          else
+            if ! grep -qE '^\s+http:\s' "$p"; then
+              echo "::error::ancora 'http:' nao encontrada em $p."
+              exit 1
+            fi
+            sed -i -e '0,/^\(\s\+\)http:\s/s//\1crypto: ^3.0.3\n&/' "$p"
+            grep -nE '^\s+(crypto|http):' "$p"
+          fi
+
+      - name: Enganchar o agente no main.dart
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/lib/main.dart
+          imp="import 'package:flutter_hbb/models/state_model.dart';"
+          call='if (isAndroid) platformFFI.syncAndroidServiceAppDirConfigPath();'
+
+          for a in "$imp" "$call"; do
+            if ! grep -qF "$a" "$f"; then
+              echo "::error::ancora nao encontrada em main.dart: $a"
+              echo "::error::O RustDesk mudou o arquivo — revisar antes de seguir."
+              exit 1
+            fi
+          done
+
+          if grep -qF 'acessofast/agent.dart' "$f"; then
+            echo "ja enganchado, pulando."
+          else
+            # import: logo apos um import estavel do proprio flutter_hbb
+            sed -i -e "s|$imp|$imp\nimport 'package:flutter_hbb/acessofast/agent.dart';|" "$f"
+            # chamada: em runMobileApp, DEPOIS do config path (o agente grava
+            # estado em disco) e ANTES do runApp — nao bloqueia, so dispara.
+            sed -i -e "s|$call|$call\n  if (isAndroid) acessofastAgentStart();|" "$f"
+          fi
+
+          echo "--- resultado ---"
+          grep -n 'acessofast' "$f"
+          if ! grep -qF 'acessofastAgentStart();' "$f"; then
+            echo "::error::a chamada do agente nao entrou no main.dart."
+            exit 1
+          fi
+          echo "agente enganchado."
 
       - name: Install flutter
         uses: subosito/flutter-action@v2
