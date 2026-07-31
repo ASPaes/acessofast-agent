@@ -45,6 +45,7 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 import 'onboarding.dart';
+import 'session.dart';
 
 const String _fnBase = 'https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1';
 const String _claimRegisterUrl = '$_fnBase/claim-register';
@@ -304,6 +305,14 @@ void acessofastAgentStart() {
       _log('agente parou por exceção não tratada: $e\n$s');
     }
   }());
+
+  // Telemetria de sessão + rotação da senha (etapas 6 e 7).
+  //
+  // Sobe JUNTO com a matrícula, não depois dela: o observador tem guarda
+  // própria (sem credencial, não posta) e precisa estar ativo antes da primeira
+  // conexão. Esperar a adoção criaria um impasse — no acesso direto é o próprio
+  // evento 'start' que dispara a auto-adoção no servidor.
+  acessofastSessionStart();
 
   // Assistente de permissões, na primeira abertura.
   //
