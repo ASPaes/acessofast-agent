@@ -44,6 +44,8 @@ import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+import 'onboarding.dart';
+
 const String _fnBase = 'https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1';
 const String _claimRegisterUrl = '$_fnBase/claim-register';
 const String _claimStatusUrl = '$_fnBase/claim-status';
@@ -302,4 +304,19 @@ void acessofastAgentStart() {
       _log('agente parou por exceção não tratada: $e\n$s');
     }
   }());
+
+  // Assistente de permissões, na primeira abertura.
+  //
+  // O atraso NÃO é estético: o diálogo usa o overlay do RustDesk, que só existe
+  // depois que a interface montou. Chamar junto com runMobileApp() cairia num
+  // overlay inexistente e o assistente simplesmente não apareceria.
+  unawaited(
+    Future<void>.delayed(const Duration(seconds: 4), () async {
+      try {
+        await showAcessofastOnboarding();
+      } catch (e) {
+        _log('assistente não abriu: $e');
+      }
+    }),
+  );
 }

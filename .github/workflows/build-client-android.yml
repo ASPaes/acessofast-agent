@@ -148,6 +148,7 @@ jobs:
           set -euo pipefail
           [ -f ./branding/icon.png ] || { echo "::error::branding/icon.png ausente."; exit 1; }
           [ -f ./mobile/agent.dart ] || { echo "::error::mobile/agent.dart ausente."; exit 1; }
+          [ -f ./mobile/onboarding.dart ] || { echo "::error::mobile/onboarding.dart ausente."; exit 1; }
           echo "branding e agente ok."
 
   generate-bridge:
@@ -197,7 +198,7 @@ jobs:
           cp ./branding/icon.png "$RUNNER_TEMP/af-branding/icon.png"
           # agent.dart precisa sobreviver ao checkout do rustdesk pelo mesmo
           # motivo do branding: o checkout sobrescreve o workspace inteiro.
-          cp ./mobile/agent.dart "$RUNNER_TEMP/af-agent/agent.dart"
+          cp ./mobile/agent.dart ./mobile/onboarding.dart "$RUNNER_TEMP/af-agent/"
           echo "AF_BRANDING=$RUNNER_TEMP/af-branding" >> "$GITHUB_ENV"
           echo "AF_AGENT=$RUNNER_TEMP/af-agent" >> "$GITHUB_ENV"
           ls -la "$RUNNER_TEMP/af-branding" "$RUNNER_TEMP/af-agent"
@@ -552,7 +553,9 @@ jobs:
           set -euo pipefail
           mkdir -p ./flutter/lib/acessofast
           cp "$AF_AGENT/agent.dart" ./flutter/lib/acessofast/agent.dart
-          echo "agent.dart instalado ($(wc -l < ./flutter/lib/acessofast/agent.dart) linhas)"
+          cp "$AF_AGENT/onboarding.dart" ./flutter/lib/acessofast/onboarding.dart
+          echo "agent.dart      ($(wc -l < ./flutter/lib/acessofast/agent.dart) linhas)"
+          echo "onboarding.dart ($(wc -l < ./flutter/lib/acessofast/onboarding.dart) linhas)"
 
           # O agente usa sha256 (protocolo do claim) e o RustDesk nao declara o
           # pacote crypto. E pure-Dart, do time do Dart, sem codigo nativo.
