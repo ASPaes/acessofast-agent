@@ -342,6 +342,42 @@ jobs:
           echo "--- resultado ---"
           grep -n 'FFI.startServer' "$f"
 
+      # SEGUNDO CAMINHO DA IDENTIDADE — sem isto o app abre como "RustDesk".
+      #
+      # Descoberto no run #3: o MainService.kt (step acima) e o servico de
+      # COMPARTILHAMENTO DE TELA — so sobe quando alguem comeca a compartilhar.
+      # Na abertura do app, o Flutter inicializa o nucleo com config vazia:
+      #
+      #   src/flutter_ffi.rs — fn initialize(app_dir, custom_client_config)
+      #     if custom_client_config.is_empty() { load_custom_client() }   <- ESTE
+      #     else { read_custom_client(custom_client_config) }             <- MainService
+      #
+      # O load_custom_client procura o custom.txt no diretorio do executavel —
+      # que no Android nao existe (§ cabecalho, item 1). Resultado: APP_NAME
+      # continua "RustDesk" e o titulo do app sai errado, mesmo com o
+      # MainService injetado corretamente.
+      #
+      # Aqui fechamos o caminho de abertura: load_custom_client passa a aplicar
+      # a identidade direto, sem tocar em disco. Os dois caminhos agora levam ao
+      # mesmo lugar.
+      - name: Injetar identidade no load_custom_client (caminho de abertura)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./src/common.rs
+          anchor='pub fn load_custom_client() {'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora 'pub fn load_custom_client() {' nao encontrada em $f."
+            exit 1
+          fi
+          if grep -qF 'AcessoFast custom client' "$f"; then
+            echo "ja injetado, pulando."
+          else
+            sed -i -e 's|pub fn load_custom_client() {|// AcessoFast custom client (injetado no CI)\n#[allow(unreachable_code)]\npub fn load_custom_client() {\n    read_custom_client("${{ env.custom }}");\n    return;|' "$f"
+          fi
+          echo "--- resultado ---"
+          grep -n -A 4 'pub fn load_custom_client' "$f"
+
       - name: Sanidade da identidade (FALHA o build se nao entrou)
         shell: bash
         run: |
@@ -355,7 +391,15 @@ jobs:
             echo "::error::o base64 da identidade nao esta no MainService.kt."
             exit 1
           fi
-          echo "identidade AcessoFast injetada e conferida."
+          # Caminho 2: abertura do app (load_custom_client). Sem este, o app
+          # abre como "RustDesk" mesmo com o MainService correto — foi o run #3.
+          c=./src/common.rs
+          if ! grep -qF '${{ env.custom }}' "$c"; then
+            echo "::error::o base64 da identidade nao esta no load_custom_client (common.rs)."
+            echo "::error::O app abriria como RustDesk. Ver step 'caminho de abertura'."
+            exit 1
+          fi
+          echo "identidade AcessoFast conferida nos DOIS caminhos (abertura + servico)."
 
       # applicationId proprio: sem isto o APK colide com o RustDesk oficial no
       # mesmo aparelho e nao poderia ir pra Play Store como app nosso.
