@@ -371,25 +371,85 @@ jobs:
           sed -i -e 's|applicationId "com.carriez.flutter_hbb"|applicationId "${{ env.applicationId }}"|' "$f"
           grep -n 'applicationId' "$f"
 
+      # O NOME QUE O USUARIO VE VEM DAQUI — nao do read_custom_client.
+      # Descoberto no run #2: o APK instalou como "RustDesk" mesmo com a
+      # identidade injetada corretamente. Sao camadas diferentes:
+      #   - android:label (AndroidManifest)  -> nome na gaveta de apps/instalador
+      #   - app-name do custom (base64)      -> config::APP_NAME no runtime do Rust
+      #                                         (namespace de config, textos internos)
+      # Precisamos DOS DOIS. O segundo ja estava; este step fecha o primeiro.
+      #
+      # O 'RustDesk Input' e o nome do SERVICO DE ACESSIBILIDADE — e exatamente o
+      # que o cliente le em Configuracoes > Acessibilidade na hora de liberar o
+      # controle remoto. Deixar "RustDesk" ali seria confuso e mina a confianca.
+      - name: Branding do AndroidManifest (nome do app e do servico)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/android/app/src/main/AndroidManifest.xml
+          if ! grep -qF 'android:label="RustDesk"' "$f"; then
+            echo "::error::android:label=\"RustDesk\" nao encontrado em $f — RustDesk mudou o manifest."
+            exit 1
+          fi
+          # 'RustDesk Input' primeiro: e uma string mais longa e especifica.
+          sed -i -e 's|android:label="RustDesk Input"|android:label="${{ env.appname }} Input"|' "$f"
+          sed -i -e 's|android:label="RustDesk"|android:label="${{ env.appname }}"|' "$f"
+          echo "--- resultado ---"
+          grep -n 'android:label' "$f"
+          if grep -q 'android:label="RustDesk' "$f"; then
+            echo "::error::ainda restou android:label com RustDesk no manifest."
+            exit 1
+          fi
+          echo "manifest branded."
+
       - name: removeNewVersionNotif
         continue-on-error: true
         shell: bash
         run: |
           sed -i -e 's|https://api.github.com/repos/rustdesk/rustdesk/releases/latest||' ./src/common.rs
 
+      # SEM continue-on-error de proposito: no run #2 este step passou "verde" e
+      # mesmo assim o aparelho mostrou o icone do RustDesk. Falha silenciosa de
+      # branding e o que este workflow inteiro tenta evitar.
+      #
+      # A causa era o ICONE ADAPTATIVO: o RustDesk traz
+      # mipmap-anydpi-v26/ic_launcher.xml, e no Android 8+ o XML adaptativo tem
+      # PRIORIDADE sobre os PNGs por densidade. Trocar so os PNGs nao muda nada
+      # no aparelho. Removemos os XMLs -> @mipmap/ic_launcher volta a resolver
+      # pros PNGs que geramos aqui.
+      # (Trade-off aceito: perde-se o mascaramento adaptativo do launcher. Em v1
+      # vale mais a marca correta do que o formato bonito.)
       - name: Icone do launcher (branding)
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           src="$AF_BRANDING/icon.png"
+          res=./flutter/android/app/src/main/res
+          rm -f "$res/mipmap-anydpi-v26/ic_launcher.xml" \
+                "$res/mipmap-anydpi-v26/ic_launcher_round.xml"
+          rmdir "$res/mipmap-anydpi-v26" 2>/dev/null || true
+
+          # ImageMagick 7 renomeou `convert` para `magick`; aceitamos os dois.
+          IM=convert
+          command -v magick >/dev/null 2>&1 && IM=magick
+
           declare -A d=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
           for k in "${!d[@]}"; do
-            out="./flutter/android/app/src/main/res/mipmap-$k"
+            out="$res/mipmap-$k"
             mkdir -p "$out"
-            convert "$src" -resize "${d[$k]}x${d[$k]}" "$out/ic_launcher.png"
+            "$IM" "$src" -resize "${d[$k]}x${d[$k]}" "$out/ic_launcher.png"
+            cp "$out/ic_launcher.png" "$out/ic_launcher_round.png"
           done
-          echo "icones do launcher aplicados."
+
+          # Verificacao: sem XML adaptativo sobrando e com PNG de fato gerado.
+          if [ -f "$res/mipmap-anydpi-v26/ic_launcher.xml" ]; then
+            echo "::error::ic_launcher.xml adaptativo ainda existe — o icone do RustDesk venceria."
+            exit 1
+          fi
+          [ -s "$res/mipmap-xxxhdpi/ic_launcher.png" ] || {
+            echo "::error::ic_launcher.png nao foi gerado."; exit 1; }
+          echo "icones do launcher aplicados:"
+          ls -la "$res/mipmap-xxxhdpi/"
 
       - name: Install flutter
         uses: subosito/flutter-action@v2
