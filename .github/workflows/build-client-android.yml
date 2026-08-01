@@ -147,6 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           [ -f ./branding/icon.png ] || { echo "::error::branding/icon.png ausente."; exit 1; }
+          [ -f ./branding/notification-icon.png ] || { echo "::error::branding/notification-icon.png ausente (icone da barra de status)."; exit 1; }
           [ -f ./mobile/agent.dart ] || { echo "::error::mobile/agent.dart ausente."; exit 1; }
           [ -f ./mobile/onboarding.dart ] || { echo "::error::mobile/onboarding.dart ausente."; exit 1; }
           [ -f ./mobile/session.dart ] || { echo "::error::mobile/session.dart ausente."; exit 1; }
@@ -197,6 +198,9 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/af-branding" "$RUNNER_TEMP/af-agent"
           cp ./branding/icon.png "$RUNNER_TEMP/af-branding/icon.png"
+          # icone da notificacao (barra de status) — mesmo motivo do icon.png:
+          # o checkout do rustdesk apaga ./branding/.
+          cp ./branding/notification-icon.png "$RUNNER_TEMP/af-branding/notification-icon.png"
           # agent.dart precisa sobreviver ao checkout do rustdesk pelo mesmo
           # motivo do branding: o checkout sobrescreve o workspace inteiro.
           cp ./mobile/agent.dart ./mobile/onboarding.dart ./mobile/session.dart "$RUNNER_TEMP/af-agent/"
@@ -592,6 +596,43 @@ jobs:
             echo "::error::ic_launcher.png nao foi gerado."; exit 1; }
           echo "icones do launcher aplicados:"
           ls -la "$res/mipmap-xxxhdpi/"
+
+      # Icone da NOTIFICACAO (barra de status). E o que MainService.kt referencia
+      # em setSmallIcon(R.mipmap.ic_stat_logo) — a seta da imagem 2 do cliente.
+      # A notificacao NAO e removida (ela e o que segura o foreground service vivo
+      # nas fabricantes agressivas; e o titulo ja sai "AcessoFast"). So trocamos o
+      # icone, que ainda era o do RustDesk.
+      #
+      # O Android renderiza o small icon como SILHUETA: usa so o canal alpha e
+      # pinta de branco. Por isso forcamos RGB=branco (mantendo o alpha) — o
+      # source ja e branco, isto e cinto-e-suspensorio — e centralizamos num
+      # canvas QUADRADO transparente (o source e 256x195; sem isso distorceria).
+      # Tamanhos padrao de status bar: 24dp por densidade.
+      - name: Icone da notificacao (ic_stat_logo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$AF_BRANDING/notification-icon.png"
+          res=./flutter/android/app/src/main/res
+          [ -f "$src" ] || { echo "::error::notification-icon.png nao preservado."; exit 1; }
+
+          IM=convert
+          command -v magick >/dev/null 2>&1 && IM=magick
+
+          declare -A d=( [mdpi]=24 [hdpi]=36 [xhdpi]=48 [xxhdpi]=72 [xxxhdpi]=96 )
+          for k in "${!d[@]}"; do
+            sz=${d[$k]}
+            out="$res/mipmap-$k"
+            mkdir -p "$out"
+            "$IM" "$src" -channel RGB -evaluate set 100% +channel \
+              -resize "${sz}x${sz}" -background none -gravity center -extent "${sz}x${sz}" \
+              "$out/ic_stat_logo.png"
+          done
+
+          [ -s "$res/mipmap-xxxhdpi/ic_stat_logo.png" ] || {
+            echo "::error::ic_stat_logo.png nao foi gerado."; exit 1; }
+          echo "icone da notificacao aplicado:"
+          ls -la "$res"/mipmap-*/ic_stat_logo.png
 
       # ---------------------------------------------------------------------
       # AGENTE EMBUTIDO (etapa 5 do MOBILE-DESIGN.md) — matricula por nonce.
