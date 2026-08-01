@@ -524,29 +524,83 @@ jobs:
             exit 1
           fi
 
-      # Remove o icone flutuante (overlay preto-e-branco tipo RustDesk) que
-      # aparecia com o app em segundo plano (FloatingWindowService). E inutil no
-      # AcessoFast e o cliente reclamou. onStop() so inicia esse servico quando
-      # disableFloatingWindow == false; forcamos true. De quebra, o app deixa de
-      # pedir a permissao de "sobrepor a outros apps" (ver toggleService no
-      # server_model, que so pede o overlay quando a opcao != 'Y').
-      - name: Desabilitar janela flutuante (floating window)
+      # Janela flutuante INVISIVEL (nao desativada). Historia:
+      #   1a tentativa: desativamos o FloatingWindowService de vez, pra sumir com
+      #   o icone flutuante que o cliente reclamou. Efeito colateral GRAVE: esse
+      #   overlay e o que segura FLAG_KEEP_SCREEN_ON durante o controle. Sem ele,
+      #   settings_page/server_model caem em KeepScreenOn.never -> a tela apaga no
+      #   meio do atendimento e a imagem some ("perde a imagem se a tela apagar").
+      #
+      # Solucao: deixamos o overlay RODANDO, mas 100% transparente. transparency
+      # = 0f => alpha 0 (invisivel) e, no proprio codigo, ja liga FLAG_NOT_TOUCHABLE
+      # ("if (viewUntouchable || viewTransparency == 0f)"), entao nao intercepta
+      # toque. O cliente nao ve icone nenhum, e o keep-screen-on volta a funcionar.
+      # Custo: precisa da permissao "sobrepor a outros apps" (overlay), que o
+      # toggleService ja pede — nao e "configuracao restrita", e so um toggle.
+      - name: Janela flutuante invisivel (mantem keep-screen-on, sem icone)
         shell: bash
         run: |
           set -euo pipefail
-          f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainActivity.kt
-          anchor='val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"'
+          f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/FloatingWindowService.kt
+          anchor='private var viewTransparency = 1f'
           if ! grep -qF "$anchor" "$f"; then
-            echo "::error::ancora do disableFloatingWindow nao encontrada em $f — RustDesk mudou o MainActivity.kt."
+            echo "::error::ancora 'viewTransparency = 1f' nao encontrada em $f — RustDesk mudou o FloatingWindowService.kt."
             exit 1
           fi
-          sed -i -e 's|val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"|val disableFloatingWindow = true // AcessoFast: sem janela flutuante|' "$f"
+          sed -i -e 's|private var viewTransparency = 1f|private var viewTransparency = 0f|' "$f"
           echo "--- resultado ---"
-          grep -n 'disableFloatingWindow' "$f"
-          if grep -qF 'FFI.getLocalOption("disable-floating-window")' "$f"; then
-            echo "::error::patch da janela flutuante nao aplicou — ainda le a opcao."
+          grep -n 'private var viewTransparency' "$f"
+          if ! grep -qF 'private var viewTransparency = 0f' "$f"; then
+            echo "::error::patch da janela invisivel nao aplicou."
             exit 1
           fi
+
+      # Notificacao do foreground service menos intrusiva. O canal do RustDesk e
+      # IMPORTANCE_HIGH (faz som/heads-up e fica no topo). Baixamos pra LOW: o
+      # icone continua aparecendo (branding), mas sem som e mais discreto.
+      # OBS pro cliente (imagem 6): a notificacao "Servico esta em execucao" NAO
+      # pode ser deslizada enquanto o servico roda — e exigencia do Android pra
+      # foreground service (e justamente o que segura o app vivo). LOW e o maximo
+      # que da pra suavizar sem perder o servico em background.
+      - name: Notificacao discreta (IMPORTANCE_LOW)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
+          if ! grep -qF 'NotificationManager.IMPORTANCE_HIGH' "$f"; then
+            echo "::error::IMPORTANCE_HIGH nao encontrado em $f — RustDesk mudou o MainService.kt."
+            exit 1
+          fi
+          sed -i -e 's|NotificationManager.IMPORTANCE_HIGH|NotificationManager.IMPORTANCE_LOW|' "$f"
+          echo "--- resultado ---"
+          grep -n 'IMPORTANCE_' "$f"
+
+      # Imagem some ao RECONECTAR (fica "aguardando pela imagem", so volta se
+      # desligar/ligar a captura). Causa: em startCapture(), o listener do
+      # imageReader descarta frames enquanto _isStart==false; e _isStart so vira
+      # true DEPOIS de criar surface+virtualDisplay. Numa tela parada, o unico
+      # frame pos-resume chega nesse intervalo, e descartado, e nao vem outro ->
+      # o controlador espera pra sempre. Setar _isStart ANTES de criar a surface
+      # fecha essa janela. Fica DEPOIS do updateScreenInfo de proposito (senao
+      # cairia no ramo 'if (isStart) { stopCapture; ...; startCapture }' e
+      # recursaria). O _isStart = true original mais abaixo vira redundante/inocuo.
+      - name: Corrigir imagem ao reconectar (isStart antes da surface)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
+          anchor='surface = createSurface()'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora 'surface = createSurface()' nao encontrada em $f."
+            exit 1
+          fi
+          if grep -qF 'AcessoFast: isStart antes da surface' "$f"; then
+            echo "ja aplicado, pulando."
+          else
+            sed -i -e 's|surface = createSurface()|_isStart = true // AcessoFast: isStart antes da surface (nao perde o 1o frame ao reconectar)\n        surface = createSurface()|' "$f"
+          fi
+          echo "--- resultado ---"
+          grep -n 'createSurface()\|isStart antes da surface' "$f"
 
       - name: removeNewVersionNotif
         continue-on-error: true
@@ -619,13 +673,19 @@ jobs:
           IM=convert
           command -v magick >/dev/null 2>&1 && IM=magick
 
+          # -trim tira a moldura transparente do source (256x195, simbolo com
+          # muita margem) ANTES de redimensionar — sem isso o "A" saia minusculo
+          # na barra (imagem 5, comparado ao Discord). Depois centraliza num
+          # canvas quadrado, deixando ~8% de respiro pra nao colar nas bordas.
           declare -A d=( [mdpi]=24 [hdpi]=36 [xhdpi]=48 [xxhdpi]=72 [xxxhdpi]=96 )
           for k in "${!d[@]}"; do
             sz=${d[$k]}
+            inner=$(( sz * 92 / 100 ))
             out="$res/mipmap-$k"
             mkdir -p "$out"
             "$IM" "$src" -channel RGB -evaluate set 100% +channel \
-              -resize "${sz}x${sz}" -background none -gravity center -extent "${sz}x${sz}" \
+              -trim +repage \
+              -resize "${inner}x${inner}" -background none -gravity center -extent "${sz}x${sz}" \
               "$out/ic_stat_logo.png"
           done
 
