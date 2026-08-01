@@ -348,6 +348,55 @@ Future<void> _ensurePermanentPasswordMode() async {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-ligar o serviço ao abrir o app (etapa: acesso desassistido)
+// ---------------------------------------------------------------------------
+// O técnico precisa acessar sem o cliente caçar o botão "Iniciar serviço". Não
+// dá para pular o diálogo do sistema ("Iniciar agora" / MediaProjection) — é
+// trava do Android, nenhum app contorna — MAS ele é UMA VEZ SÓ: concedido, o
+// serviço segue vivo em segundo plano e as reconexões seguintes não pedem nada.
+// Então auto-ligamos na abertura; o cliente só interage no 1º start (e após um
+// reboot, que zera a permissão de captura). NÃO auto-desligamos: derrubar o
+// serviço obrigaria um novo toque a cada atendimento — o oposto do desassistido.
+
+const String _onboardingFlagFile = 'acessofast_onboarding.done';
+
+/// O assistente de primeira abertura (onboarding.dart) grava esta marca quando
+/// já rodou. Enquanto ele não rodou, é ELE quem conduz o cliente a ligar o
+/// serviço; não auto-ligamos junto para não abrir o diálogo de captura duas
+/// vezes nem brigar com o toggleService do assistente (que alterna, não liga).
+Future<bool> _onboardingDone() async {
+  try {
+    final dir = await getApplicationSupportDirectory();
+    return await File('${dir.path}/$_onboardingFlagFile').exists();
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Liga o serviço automaticamente na abertura. NUNCA bloqueia nem propaga
+/// exceção — se o auto-start falhar, o cliente ainda pode ligar pela tela.
+void acessofastAutoStartService() {
+  unawaited(
+    // O delay não é estético: o start dispara o diálogo do sistema, que precisa
+    // da interface montada (mesmo motivo do atraso do assistente). 5s deixa o
+    // núcleo do RustDesk subir e o assistente aparecer/gravar sua marca antes.
+    Future<void>.delayed(const Duration(seconds: 5), () async {
+      try {
+        if (!isAndroid) return;
+        // 1ª abertura: o assistente conduz; não competimos com ele.
+        if (!await _onboardingDone()) return;
+        // Já ligado (processo/serviço vivo desde um start anterior): nada a fazer.
+        if (gFFI.serverModel.isStart) return;
+        _log('ligando o serviço automaticamente');
+        await gFFI.serverModel.startService();
+      } catch (e) {
+        _log('auto-start do serviço falhou: $e');
+      }
+    }),
+  );
+}
+
 /// Inicia o observador. Não bloqueia e nunca propaga exceção.
 void acessofastSessionStart() {
   unawaited(() async {
@@ -371,4 +420,9 @@ void acessofastSessionStart() {
       _log('observador não subiu: $e\n$s');
     }
   }());
+
+  // Auto-liga o serviço na abertura (guarda própria: só depois do assistente e
+  // só se ainda não estiver ligado). Fica fora do bloco acima de propósito, para
+  // disparar mesmo que o observador tropece ao subir.
+  acessofastAutoStartService();
 }
