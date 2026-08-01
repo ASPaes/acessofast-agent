@@ -56,6 +56,11 @@ on:
         required: true
         default: '1.4.9'
         type: string
+      gerar_aab:
+        description: 'Gerar tambem o .aab (Android App Bundle) para publicar na Play Store'
+        required: false
+        default: false
+        type: boolean
 
 env:
   RUST_VERSION: "1.75"
@@ -890,6 +895,28 @@ jobs:
              ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
           ls -la ./AcessoFast-*.apk
 
+      # AAB (Android App Bundle) — formato que a Play Store exige para publicar.
+      # So roda quando 'gerar_aab' e marcado, pra nao dobrar o tempo dos builds de
+      # teste. Reaproveita os jniLibs e o libc++_shared.so ja postos pelo step do
+      # APK, e a MESMA assinatura release (key.properties ainda existe aqui — a
+      # limpeza dos segredos vem depois). arm64-only, igual ao APK; a Play entrega
+      # so pra aparelhos arm64, que e o escopo atual.
+      - name: Build AAB (Play Store)
+        if: ${{ inputs.gerar_aab }}
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
+          pushd flutter
+          flutter build appbundle --release --target-platform android-arm64
+          popd
+          mv ./flutter/build/app/outputs/bundle/release/app-release.aab \
+             ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.aab
+          ls -la ./AcessoFast-*.aab
+
       - name: Limpar segredos do workspace
         if: always()
         shell: bash
@@ -902,4 +929,12 @@ jobs:
         with:
           name: acessofast-android-${{ matrix.job.arch }}
           path: ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          if-no-files-found: error
+
+      - name: Publicar o AAB AcessoFast como artefato (Play Store)
+        if: ${{ inputs.gerar_aab }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: acessofast-android-${{ matrix.job.arch }}-aab
+          path: ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.aab
           if-no-files-found: error
