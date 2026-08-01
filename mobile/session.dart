@@ -70,6 +70,9 @@ const int _pwLen = 20;
 
 const String _credentialsFile = 'acessofast_agent.json';
 const String _pendingFile = 'acessofast_rotate.pending';
+// Marca (uma vez por aparelho) de que a senha ja foi sincronizada com o painel
+// logo apos a matricula. Ver _maybeInitialSync.
+const String _pwSyncFlagFile = 'acessofast_pwsync.done';
 
 void _log(String msg) {
   // ignore: avoid_print
@@ -191,16 +194,19 @@ Future<bool> _reportRotation(String pw) async {
 
 bool _rotating = false; // serializa: dois 'end' seguidos não rodam concorrentes
 
-Future<void> _rotateNow() async {
+/// Retorna true se a senha foi APLICADA no aparelho (o painel recebe via
+/// reporte ou pelo laço de retry). false = não aplicou (núcleo ainda subindo,
+/// sem credencial, ou já rotacionando) — o chamador pode reintentar.
+Future<bool> _rotateNow() async {
   if (_rotating) {
     _log('rotação já em andamento, pulando');
-    return;
+    return false;
   }
   _rotating = true;
   try {
     if (!await _loadCredentials()) {
       _log('ROTATE skip: sem credencial (matrícula pendente?)');
-      return;
+      return false;
     }
 
     final pw = _genPassword();
@@ -212,11 +218,11 @@ Future<void> _rotateNow() async {
       applied = await bind.mainSetPermanentPasswordWithResult(password: pw);
     } catch (e) {
       _log('ROTATE ABORT: setPermanentPassword lançou: $e');
-      return;
+      return false;
     }
     if (!applied) {
       _log('ROTATE ABORT: setPermanentPassword retornou false (senha antiga mantida)');
-      return;
+      return false;
     }
 
     // 2) a senha nova JÁ está no aparelho -> registra a pendência antes de
@@ -234,6 +240,7 @@ Future<void> _rotateNow() async {
     } else {
       _log('ROTATE pendente — o retry reenvia');
     }
+    return true; // aplicada no aparelho (reporte pode ficar pendente)
   } finally {
     _rotating = false;
   }
@@ -305,9 +312,54 @@ DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
 DateTime _lastPresence = DateTime.fromMillisecondsSinceEpoch(0);
 DateTime _lastRetry = DateTime.fromMillisecondsSinceEpoch(0);
 
+// Evita reprocessar o sync inicial a cada tick (a marca definitiva e o arquivo
+// em disco; esta flag so poupa I/O dentro do mesmo processo).
+bool _initialSyncChecked = false;
+
+/// Sincroniza a senha permanente com o painel UMA VEZ, logo apos a matricula.
+///
+/// Sem isto, no 1o acesso o painel serve a senha provisionada que o aparelho
+/// ainda NAO tem -> a senha nao bate -> o RustDesk cai no caminho de "clique
+/// para aceitar" e o tecnico ve "aguarde enquanto o cliente aceita". A rotacao
+/// so acontecia no FIM da 1a sessao, por isso "cancelar e tentar de novo"
+/// funcionava. Aqui geramos+aplicamos+reportamos a senha ANTES do 1o acesso.
+///
+/// Roda so com o aparelho ocioso (chamador garante) e marca em disco para nao
+/// rotacionar a cada abertura do app — a rotacao de fim de sessao mantem tudo
+/// sincronizado dai em diante.
+Future<void> _maybeInitialSync() async {
+  if (_initialSyncChecked) return;
+  try {
+    final f = await _file(_pwSyncFlagFile);
+    if (await f.exists()) {
+      _initialSyncChecked = true;
+      return;
+    }
+    // Ainda sem credencial = matricula pendente. Nao marca; tenta no proximo tick.
+    if (!await _loadCredentials()) return;
+
+    _log('sincronizacao inicial da senha (1o acesso)');
+    final applied = await _rotateNow(); // gera + aplica no aparelho + reporta
+    if (applied) {
+      _initialSyncChecked = true;
+      await f.writeAsString(jsonEncode({'done': true}), flush: true);
+    }
+    // Nao aplicou (nucleo ainda subindo)? _initialSyncChecked segue false e o
+    // proximo tick tenta de novo — sem gravar a marca.
+  } catch (e) {
+    _log('sync inicial da senha falhou: $e (tentara de novo)');
+  }
+}
+
 Future<void> _tick() async {
   final now = DateTime.now();
   final active = _activeCount();
+
+  // Sincroniza a senha com o painel antes do 1o acesso, so com o aparelho
+  // ocioso (nunca no meio de uma sessao).
+  if (active == 0) {
+    await _maybeInitialSync();
+  }
 
   if (_prevActive == 0 && active > 0) {
     await _postEvent('start', controllerId: _controllerId());
