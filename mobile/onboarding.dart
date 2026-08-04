@@ -173,12 +173,49 @@ Future<void> showAcessofastOnboarding({bool forcar = false}) async {
                   setState(() {});
                 },
               ),
+              // PASSO 3 e 4 juntos resolvem o "controle". Foram SEPARADOS de
+              // propósito: em aparelho com o app instalado fora da Play Store
+              // (todo cliente hoje), o Android TRANCA a chave de Acessibilidade
+              // até o usuário "Permitir configurações restritas" na tela de
+              // Informações do aplicativo. Levar direto pra Acessibilidade (o
+              // que o passo único fazia) caía numa opção acinzentada — a
+              // reclamação nº1. Não existe API pra ler nem pra pular esse
+              // estado, então guiamos os dois toques, na ordem certa.
+              //
+              // Os dois passos só ficam verdes quando o input REALMENTE liga
+              // (sm.inputOk) — que é a única prova confiável de que a restrição
+              // foi liberada. Assim o botão "Liberar" continua disponível caso
+              // o cliente erre o caminho e precise voltar. Quando o app vier da
+              // Play Store este passo 3 deixa de ser necessário (sideload é o
+              // que ativa a restrição) — reavaliar lá.
               _step(
                 n: 3,
-                titulo: 'Permitir controle',
+                titulo: 'Liberar o controle',
+                descricao:
+                    'Como o app foi instalado fora da Play Store, o Android '
+                    'tranca o próximo passo até você liberar. Vai abrir '
+                    '"Informações do aplicativo" — toque em "Permitir '
+                    'configurações restritas" (no topo; em alguns aparelhos, no '
+                    'menu ⋮ do canto).',
+                ok: sm.inputOk,
+                acao: 'Liberar',
+                onTap: () async {
+                  try {
+                    AndroidPermissionManager.startAction(
+                        'android.settings.APPLICATION_DETAILS_SETTINGS');
+                  } catch (e) {
+                    _log('falha ao abrir Informações do aplicativo: $e');
+                  }
+                  setState(() {});
+                },
+              ),
+              _step(
+                n: 4,
+                titulo: 'Ativar o controle',
                 descricao:
                     'Deixa o técnico tocar na tela por você, em vez de só olhar. '
-                    'Abre as Configurações do Android — ative "AcessoFast Input".',
+                    'Abre a Acessibilidade — ative "AcessoFast Input". Se a opção '
+                    'estiver acinzentada, volte ao passo 3.',
                 ok: sm.inputOk,
                 onTap: () async {
                   try {
