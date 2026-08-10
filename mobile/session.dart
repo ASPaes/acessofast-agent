@@ -52,6 +52,17 @@ const String _rotateUrl = '$_fnBase/rotate-device-secret';
 const String _anonKey =
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsbWZ5aWJ5cm93YmdqanlibGNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM2NDMyNjIsImV4cCI6MjA5OTIxOTI2Mn0.grcQYqN3fHvFTWI0AFPWG66k1wONuGqZ5yMt07qcjxE';
 
+// Versao deste build, reportada em todo POST a session-ingest (agent_version) e
+// exibida na coluna "Agente" do painel. Mesmo contrato do `-X main.version` do
+// agente Windows: formato AAAA.MM.DD-<sha7>, data primeiro e em largura fixa pra
+// o painel ordenar builds comparando string. Injetado pelo CI com
+//
+//   flutter build apk --dart-define=ACESSOFAST_VERSION=2026.08.07-a1b2c3d
+//
+// Build local fica "dev", que o painel trata como versao desconhecida.
+const String _agentVersion =
+    String.fromEnvironment('ACESSOFAST_VERSION', defaultValue: 'dev');
+
 // Mesmos intervalos do main.go.
 const Duration _pollInterval = Duration(seconds: 3);
 const Duration _heartbeatInterval = Duration(seconds: 20);
@@ -267,6 +278,9 @@ Future<void> _postEvent(String event, {String? controllerId}) async {
       'rustdesk_id': _rustdeskId!,
       'agent_token': _token!,
       'event': event,
+      // Visibilidade de frota, igual ao main.go: pega carona no sinal que ja
+      // existe. O servidor grava em address_book.agent_version.
+      'agent_version': _agentVersion,
     };
     // Só serve de gatilho de auto-adoção no 'start'; ignorado nos demais.
     if (controllerId != null && controllerId.isNotEmpty) {

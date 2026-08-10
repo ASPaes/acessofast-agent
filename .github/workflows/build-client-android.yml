@@ -883,8 +883,16 @@ jobs:
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
           cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so \
              ./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}/
+          # Versao do agente embutido (mobile/session.dart le via
+          # String.fromEnvironment). Mesmo formato do agente Windows —
+          # AAAA.MM.DD-<sha7> — pra que os dois sejam comparaveis na coluna
+          # "Agente" do painel. Sem isto o APK reporta "dev" e o aparelho aparece
+          # no painel com versao desconhecida.
+          AGENT_VERSION="$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
+          echo "::notice::agent_version=${AGENT_VERSION}"
           pushd flutter
-          flutter build apk --release --target-platform android-arm64 --split-per-abi
+          flutter build apk --release --target-platform android-arm64 --split-per-abi \
+            --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}"
           popd
           mv ./flutter/build/app/outputs/flutter-apk/app-${{ matrix.job.abi }}-release.apk \
              ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk

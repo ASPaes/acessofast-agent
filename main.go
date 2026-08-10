@@ -71,6 +71,19 @@ const (
 // nao injete (o binario que ja roda em producao tem a chave embutida).
 var anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsbWZ5aWJ5cm93YmdqanlibGNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM2NDMyNjIsImV4cCI6MjA5OTIxOTI2Mn0.grcQYqN3fHvFTWI0AFPWG66k1wONuGqZ5yMt07qcjxE"
 
+// version identifica o build deste binario. Injetado pelo CI como
+//
+//	go build -ldflags "-X main.version=2026.08.07-a1b2c3d"
+//
+// Formato AAAA.MM.DD-<sha7>: a data vem primeiro e em largura fixa de proposito —
+// assim o painel ordena builds comparando string, sem precisar de semver. Build
+// local fica "dev", que o painel trata como versao desconhecida.
+//
+// Vai em todo POST a session-ingest (agent_version). E o que da visibilidade de
+// qual maquina roda qual build; sem isso a frota so e auditavel abrindo maquina
+// por maquina.
+var version = "dev"
+
 var (
 	// Marcadores reais confirmados em log de producao (connection.rs):
 	//   #619 Connection opened from 189.4.111.147:12288.
@@ -187,6 +200,11 @@ func postEvent(event string, controllerID string) time.Time {
 	}
 	m := map[string]string{
 		"rustdesk_id": rustdeskID, "agent_token": token, "event": event,
+		// Visibilidade de frota: pega carona no sinal que ja existe (presence 60s /
+		// heartbeat 20s), entao o painel sabe a versao de uma maquina ligada em ate
+		// 1 min, sem nenhuma requisicao nova. O servidor grava em
+		// address_book.agent_version.
+		"agent_version": version,
 	}
 	// controller_rustdesk_id (auto-adocao): rustdesk_id do peer (controlador), quando
 	// conhecido. So no 'start' serve de gatilho pro servidor auto-adotar um device ainda

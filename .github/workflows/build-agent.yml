@@ -63,6 +63,16 @@ jobs:
           else
             echo "::notice::SUPABASE_ANON_KEY vazio — usando o fallback hardcoded do main.go (mesma chave)"
           fi
+
+          # Versao do build, reportada pelo agente em todo POST a session-ingest e
+          # exibida na coluna "Agente" do painel. Data primeiro e em largura fixa
+          # (AAAA.MM.DD) de proposito: o painel ordena builds por comparacao de
+          # string, sem semver. O sha7 e a procedencia — dado o rotulo que uma
+          # maquina reporta, da pra achar o commit exato que rodou nela.
+          VERSION="$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
+          LDFLAGS="$LDFLAGS -X main.version=${VERSION}"
+          echo "::notice::version=${VERSION}"
+
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
             go build -trimpath -ldflags "$LDFLAGS" -o acessofast-agent.exe .
           ls -la acessofast-agent.exe
