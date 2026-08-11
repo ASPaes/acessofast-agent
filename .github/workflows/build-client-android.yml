@@ -56,6 +56,11 @@ on:
         required: true
         default: '1.4.9'
         type: string
+      gerar_aab:
+        description: 'Gerar tambem o .aab (Android App Bundle) para publicar na Play Store'
+        required: false
+        default: false
+        type: boolean
 
 env:
   RUST_VERSION: "1.75"
@@ -890,6 +895,10 @@ jobs:
           # no painel com versao desconhecida.
           AGENT_VERSION="$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
           echo "::notice::agent_version=${AGENT_VERSION}"
+          # Exportado pro step do AAB usar o MESMO valor. Recalcular la daria uma
+          # segunda copia do formato (livre pra divergir) e, num build que cruze a
+          # meia-noite UTC, o .aab sairia com data diferente do .apk do mesmo commit.
+          echo "AGENT_VERSION=${AGENT_VERSION}" >> "$GITHUB_ENV"
           pushd flutter
           flutter build apk --release --target-platform android-arm64 --split-per-abi \
             --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}"
@@ -897,6 +906,42 @@ jobs:
           mv ./flutter/build/app/outputs/flutter-apk/app-${{ matrix.job.abi }}-release.apk \
              ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
           ls -la ./AcessoFast-*.apk
+
+      # AAB (Android App Bundle) — formato que a Play Store exige para publicar.
+      # So roda quando 'gerar_aab' e marcado, pra nao dobrar o tempo dos builds de
+      # teste. Reaproveita os jniLibs e o libc++_shared.so ja postos pelo step do
+      # APK, e a MESMA assinatura release (key.properties ainda existe aqui — a
+      # limpeza dos segredos vem depois). arm64-only, igual ao APK; a Play entrega
+      # so pra aparelhos arm64, que e o escopo atual.
+      #
+      # O --dart-define aqui e obrigatorio, nao um detalhe: sem ele o bundle sai
+      # com ACESSOFAST_VERSION="dev" e TODO aparelho instalado pela Play Store
+      # reporta versao desconhecida no painel — justamente o buraco que a coluna
+      # "Agente" existe pra fechar, e do jeito mais dificil de perceber, porque o
+      # .apk lado a lado reporta certo.
+      - name: Build AAB (Play Store)
+        if: ${{ inputs.gerar_aab }}
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
+          # Vem do step do APK via GITHUB_ENV. Falhar aqui e melhor que publicar
+          # na Play Store um bundle que se identifica como "dev".
+          if [ -z "${AGENT_VERSION:-}" ]; then
+            echo "::error::AGENT_VERSION vazio — o step do APK deveria te-lo exportado."
+            exit 1
+          fi
+          echo "::notice::agent_version(aab)=${AGENT_VERSION}"
+          pushd flutter
+          flutter build appbundle --release --target-platform android-arm64 \
+            --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}"
+          popd
+          mv ./flutter/build/app/outputs/bundle/release/app-release.aab \
+             ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.aab
+          ls -la ./AcessoFast-*.aab
 
       - name: Limpar segredos do workspace
         if: always()
@@ -910,4 +955,12 @@ jobs:
         with:
           name: acessofast-android-${{ matrix.job.arch }}
           path: ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          if-no-files-found: error
+
+      - name: Publicar o AAB AcessoFast como artefato (Play Store)
+        if: ${{ inputs.gerar_aab }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: acessofast-android-${{ matrix.job.arch }}-aab
+          path: ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.aab
           if-no-files-found: error
