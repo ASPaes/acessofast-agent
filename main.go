@@ -187,16 +187,30 @@ var httpClient = &http.Client{Timeout: 12 * time.Second}
 // start/heartbeat de sessao FREE iniciada pelo painel; ausente/vazio nos demais.
 type ingestResp struct {
 	HardCapAt string `json:"hard_cap_at"`
+	// Passo 2: bloco de auto-update. So vem em 'presence' (maquina ociosa) e so
+	// quando o alvo resolvido no servidor difere da versao que este agente reportou.
+	// Ver update.go.
+	Update *updateInfo `json:"update"`
 }
 
 // postEvent posta um evento de sessao e devolve o hard_cap_at da resposta (zero se
 // ausente/ilegivel/erro). So start/heartbeat carregam cap; end/presence retornam zero.
+//
+// Wrapper de postEventFull: a esmagadora maioria dos chamadores so quer o cap, e
+// nenhum evento alem de 'presence' pode trazer update.
 func postEvent(event string, controllerID string) time.Time {
+	cap, _ := postEventFull(event, controllerID)
+	return cap
+}
+
+// postEventFull e o POST de verdade. Devolve tambem o bloco de update, que so o
+// ramo de 'presence' do worker consome.
+func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 	// Guarda: sem credencial, nao adianta postar — a session-ingest rejeitaria.
 	// Evita ruido de POST invalido a cada 60s quando a matricula ainda nao rodou.
 	if token == "" || rustdeskID == "" {
 		logln("SKIP %s: token/rustdesk_id ausente (matricula pendente?)", event)
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	m := map[string]string{
 		"rustdesk_id": rustdeskID, "agent_token": token, "event": event,
@@ -216,7 +230,7 @@ func postEvent(event string, controllerID string) time.Time {
 	req, err := http.NewRequest("POST", ingestURL, bytes.NewReader(payload))
 	if err != nil {
 		logln("POST %s erro ao montar req: %v", event, err)
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("apikey", anonKey)
@@ -224,24 +238,41 @@ func postEvent(event string, controllerID string) time.Time {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		logln("POST %s FALHOU: %v", event, err)
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
-	logln("POST %s -> HTTP %d  %s", event, resp.StatusCode, strings.TrimSpace(string(body)))
+
+	// O teto era 400 bytes, o que bastava enquanto a resposta so trazia hard_cap_at.
+	// O bloco de update (Passo 2) nao cabe nisso — so a assinatura Ed25519 em base64
+	// ja sao 88 caracteres, mais url e sha256 — e o corte no meio faria o
+	// json.Unmarshal falhar de um jeito mudo: o agente simplesmente nunca atualizaria.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+
+	// O log segue truncado em 400: quem le agent.log quer ver o ok/erro, e despejar
+	// a assinatura inteira a cada 60s so inchava o arquivo na maquina do cliente.
+	logged := strings.TrimSpace(string(body))
+	if len(logged) > 400 {
+		logged = logged[:400] + "…"
+	}
+	logln("POST %s -> HTTP %d  %s", event, resp.StatusCode, logged)
+
+	var r ingestResp
+	if json.Unmarshal(body, &r) != nil {
+		return time.Time{}, nil
+	}
 
 	// Billing B2: extrai o hard_cap_at (se veio). Tolera fracao de segundo do timestamptz.
-	var r ingestResp
-	if json.Unmarshal(body, &r) == nil && r.HardCapAt != "" {
+	cap := time.Time{}
+	if r.HardCapAt != "" {
 		if ts, e := time.Parse(time.RFC3339, r.HardCapAt); e == nil {
-			return ts
+			cap = ts
+		} else if ts, e := time.Parse(time.RFC3339Nano, r.HardCapAt); e == nil {
+			cap = ts
+		} else {
+			logln("WARN hard_cap_at ilegivel: %q", r.HardCapAt)
 		}
-		if ts, e := time.Parse(time.RFC3339Nano, r.HardCapAt); e == nil {
-			return ts
-		}
-		logln("WARN hard_cap_at ilegivel: %q", r.HardCapAt)
 	}
-	return time.Time{}
+	return cap, r.Update
 }
 
 // tailer acompanha o log e mantem o conjunto de conexoes (#N) abertas.
@@ -613,7 +644,13 @@ func worker(stop <-chan struct{}) {
 			// Durante a carencia (§3.1) a sessao ainda nao terminou de fato -> nao
 			// mandar "presence" (que so vale pra maquina comprovadamente ociosa).
 			if len(t.open) == 0 && t.graceUntil.IsZero() {
-				postEvent("presence", "")
+				// Passo 2: 'presence' e o unico evento que pode trazer update, porque e
+				// a unica prova de que a maquina esta ociosa. aplicaUpdate roda inline
+				// (nao em goroutine) de proposito: assim a troca do binario nunca corre
+				// em paralelo com outro tick de presence.
+				if _, upd := postEventFull("presence", ""); upd != nil {
+					aplicaUpdate(upd)
+				}
 			}
 		}
 	}

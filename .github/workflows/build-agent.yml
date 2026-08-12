@@ -18,16 +18,20 @@ on:
   push:
     branches: [main, master]
     paths:
-      - "main.go"
-      - "enroll.go"
-      - "matricula.go"
-      - "rotate.go"
+      # Glob, e nao a lista de arquivos que estava aqui: a lista enumerava os .go
+      # um a um e ja tinha deixado o update.go de fora — mexer no auto-update nao
+      # disparava build nenhum, e o sintoma seria "publiquei e nada aconteceu".
+      # Todo .go da raiz e o pacote do agente; um arquivo novo entra sozinho.
+      - "*.go"
+      - "tools/**"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/build-agent.yml"
 
 permissions:
-  contents: read
+  # write (e nao read) porque o passo de Release cria a tag e sobe o binario. E o
+  # minimo que `gh release create` exige; nenhum outro escopo foi aberto.
+  contents: write
 
 jobs:
   build:
@@ -72,6 +76,11 @@ jobs:
           VERSION="$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
           LDFLAGS="$LDFLAGS -X main.version=${VERSION}"
           echo "::notice::version=${VERSION}"
+          # Exportado pros passos de release usarem o MESMO valor. Recalcular la
+          # daria uma segunda copia do formato e, num build que cruze a meia-noite
+          # UTC, a tag do Release nao bateria com a versao dentro do binario — o
+          # agente se declararia numa versao que nao existe no catalogo.
+          echo "AGENT_VERSION=${VERSION}" >> "$GITHUB_ENV"
 
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
             go build -trimpath -ldflags "$LDFLAGS" -o acessofast-agent.exe .
@@ -96,3 +105,63 @@ jobs:
           path: acessofast-agent.exe
           retention-days: 30
           if-no-files-found: error
+
+      # -------------------------------------------------------------------
+      # Passo 2 (auto-update): Release assinado
+      # -------------------------------------------------------------------
+      # O artifact acima NAO serve pro auto-update: exige autenticacao pra baixar e
+      # expira em 30 dias. O Release e publico, permanente e anonimo — o agente na
+      # maquina do cliente consegue baixar dele sem credencial nenhuma.
+      #
+      # So na main: um build de branch nao vira release publicavel.
+      #
+      # Se o secret de assinatura nao existir, o passo e PULADO (nao falha): o build
+      # e o artifact continuam servindo pro fluxo manual do instalador, que e como a
+      # frota e atualizada ate o auto-update entrar em producao.
+      - name: Release assinado (auto-update)
+        if: github.ref == 'refs/heads/main'
+        env:
+          AGENT_UPDATE_SIGNING_KEY: ${{ secrets.AGENT_UPDATE_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AGENT_UPDATE_SIGNING_KEY:-}" ]; then
+            echo "::warning::AGENT_UPDATE_SIGNING_KEY ausente — Release nao publicado. O auto-update nao aceita build sem assinatura."
+            exit 0
+          fi
+
+          SHA256="$(sha256sum acessofast-agent.exe | cut -d' ' -f1)"
+          SIG="$(go run ./tools/sign-manifest -version "${AGENT_VERSION}" -sha256 "${SHA256}")"
+
+          gh release create "${AGENT_VERSION}" acessofast-agent.exe \
+            --title "Agente ${AGENT_VERSION}" \
+            --notes "Build automatico de ${GITHUB_SHA}. Publicar no catalogo com o SQL do resumo do job." \
+            --latest
+
+          URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${AGENT_VERSION}/acessofast-agent.exe"
+
+          # O SQL sai no resumo do job, e nao aplicado daqui, de proposito: publicar
+          # no catalogo NAO instala nada (quem instala e o alvo), mas o CI tambem nao
+          # tem — nem deve ter — credencial de escrita no banco de producao.
+          {
+            echo "## Release ${AGENT_VERSION} publicado"
+            echo
+            echo "Para catalogar (nao instala em ninguem — quem instala e o alvo):"
+            echo
+            echo '```sql'
+            echo "insert into public.agent_releases (version, platform, url, sha256, signature, notes)"
+            echo "values ('${AGENT_VERSION}', 'windows', '${URL}', '${SHA256}', '${SIG}', 'build de ${GITHUB_SHA}');"
+            echo '```'
+            echo
+            echo "Depois, para liberar em UMA maquina (canary):"
+            echo
+            echo '```sql'
+            echo "update public.address_book set agent_target_version = '${AGENT_VERSION}' where rustdesk_id = '<id>';"
+            echo '```'
+            echo
+            echo "So depois de conferir a coluna Agente no painel, subir pro tenant ou pro global:"
+            echo
+            echo '```sql'
+            echo "update public.agent_update_policy set target_version = '${AGENT_VERSION}', updated_at = now() where id;"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
