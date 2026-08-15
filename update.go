@@ -67,6 +67,20 @@ type updateInfo struct {
 // goroutine do worker (o update roda no ramo de 'presence'), sem mutex.
 var updateTries = map[string]int{}
 
+// Versao ja trocada no disco nesta execucao, aguardando o restart agendado.
+//
+// Existe por causa de um comportamento visto em campo (2026-08-15, primeiro
+// auto-update real): entre a troca e o restart ha ~2min em que o processo vivo
+// ainda e o binario ANTIGO, entao o agente segue se declarando na versao velha.
+// O servidor — corretamente — reoferece o update, e sem esta guarda o agente
+// rebaixava os ~5,7 MB e falhava no rename com "Access is denied", porque o .old
+// que ele tentaria sobrescrever e a imagem do proprio processo em execucao.
+//
+// Em memoria basta, e e o certo: o restart zera este estado, e depois dele a
+// versao corrente JA e a nova, entao o servidor para de oferecer sozinho.
+// Mesmo padrao sem mutex do updateTries — so a goroutine do worker toca.
+var updateAplicado string
+
 // manifestoCanonico e EXATAMENTE a string que o CI assina. Qualquer divergencia de
 // formato aqui reprova todo update — de proposito: e melhor a frota parar de
 // atualizar do que aceitar um manifesto que ninguem assinou.
@@ -271,6 +285,11 @@ func aplicaUpdate(u *updateInfo) {
 	if u.Version == version {
 		return // ja estamos nela; o servidor nem deveria ter mandado
 	}
+	if u.Version == updateAplicado {
+		// Ja trocada no disco; falta so o restart agendado disparar. Sem isto o
+		// agente refaria download e troca a cada presence da janela.
+		return
+	}
 	if updateTries[u.Version] >= updateMaxTries {
 		return // ja falhou demais nesta execucao; para de insistir a cada 60s
 	}
@@ -296,6 +315,7 @@ func aplicaUpdate(u *updateInfo) {
 		logln("update %s falhou na troca do binario: %v", u.Version, err)
 		return
 	}
+	updateAplicado = u.Version
 	logln("update %s: binario trocado (anterior guardado em .old)", u.Version)
 
 	if err := agendaRestart(); err != nil {
