@@ -269,29 +269,44 @@ func agendaRestart() error {
 	return nil
 }
 
-// aplicaUpdate roda o fluxo inteiro. Chamado SO no ramo de 'presence' do worker —
-// ou seja, com a maquina comprovadamente ociosa. Nunca no meio de um atendimento.
-func aplicaUpdate(u *updateInfo) {
-	if u == nil || u.Version == "" || u.URL == "" || u.SHA256 == "" || u.Signature == "" {
-		return
-	}
+// motivoPular decide se um manifesto deve ser IGNORADO e diz por que; "" significa
+// "pode aplicar". E deliberadamente PURA — sem rede, disco nem estado global — para
+// que a decisao seja testavel sozinha. O aplicaUpdate abaixo e que faz o IO, e
+// testa-lo em unidade exigiria mocks que provariam menos do que estes casos.
+//
+// Os motivos NAO sao logados a cada presence de proposito (so o de build local):
+// durante a janela ate o restart o servidor reoferece o mesmo update a cada 60s, e
+// logar cada recusa encheria o agent.log de ruido.
+func motivoPular(u *updateInfo, versaoAtual, jaAplicado string, tentativas int) string {
+	switch {
+	case u == nil || u.Version == "" || u.URL == "" || u.SHA256 == "" || u.Signature == "":
+		return "manifesto incompleto"
 	// Build local nao se auto-atualiza: em desenvolvimento a versao e "dev" e
 	// qualquer alvo pareceria diferente, entao o agente trocaria por baixo de quem
 	// esta depurando.
-	if version == "dev" {
-		logln("update %s ignorado: este e build local (version=dev)", u.Version)
+	case versaoAtual == "dev":
+		return "build local (version=dev)"
+	case u.Version == versaoAtual:
+		return "ja estamos nesta versao" // o servidor nem deveria ter mandado
+	case u.Version == jaAplicado:
+		return "ja trocada no disco; aguardando o restart agendado"
+	case tentativas >= updateMaxTries:
+		return "falhou demais nesta execucao"
+	}
+	return ""
+}
+
+// aplicaUpdate roda o fluxo inteiro. Chamado SO no ramo de 'presence' do worker —
+// ou seja, com a maquina comprovadamente ociosa. Nunca no meio de um atendimento.
+func aplicaUpdate(u *updateInfo) {
+	if u == nil {
 		return
 	}
-	if u.Version == version {
-		return // ja estamos nela; o servidor nem deveria ter mandado
-	}
-	if u.Version == updateAplicado {
-		// Ja trocada no disco; falta so o restart agendado disparar. Sem isto o
-		// agente refaria download e troca a cada presence da janela.
+	if motivo := motivoPular(u, version, updateAplicado, updateTries[u.Version]); motivo != "" {
+		if version == "dev" {
+			logln("update %s ignorado: %s", u.Version, motivo)
+		}
 		return
-	}
-	if updateTries[u.Version] >= updateMaxTries {
-		return // ja falhou demais nesta execucao; para de insistir a cada 60s
 	}
 	updateTries[u.Version]++
 
