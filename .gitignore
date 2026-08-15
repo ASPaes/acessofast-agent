@@ -1,0 +1,11 @@
+# Binario compilado localmente. O build oficial sai do build-agent.yml e vai pro
+# GitHub Release; um .exe de ~5,7 MB versionado aqui so polui diff e clone.
+*.exe
+
+# Chaves de assinatura do auto-update. A privada vive num GitHub Actions secret
+# (AGENT_UPDATE_SIGNING_KEY) e NUNCA no repo — se ela vazar, um release forjado
+# passa pela verificacao do agente. Rede de seguranca contra um `git add .`
+# distraido; a publica fica embutida no fonte (updatePubKeyB64 em update.go).
+*.private
+*.pem
+*.key
