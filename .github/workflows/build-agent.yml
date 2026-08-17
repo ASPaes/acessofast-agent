@@ -133,10 +133,17 @@ jobs:
           SHA256="$(sha256sum acessofast-agent.exe | cut -d' ' -f1)"
           SIG="$(go run ./tools/sign-manifest -version "${AGENT_VERSION}" -sha256 "${SHA256}")"
 
+          # --latest=false NAO e detalhe: o site (acessofast.com.br/baixar) servia
+          # o instalador por .../releases/latest/download/AcessoFastSetup.exe. Com
+          # --latest, cada build do agente movia esse ponteiro para um release que
+          # NAO tem o instalador, e o download publico virava 404 — aconteceu em
+          # 2026-08-15 e ficou quebrado ate 08-17. Sao dois canais distintos:
+          # release do agente alimenta o auto-update; instalador e para gente, e
+          # sai de um release proprio, publicado a mao.
           gh release create "${AGENT_VERSION}" acessofast-agent.exe \
             --title "Agente ${AGENT_VERSION}" \
-            --notes "Build automatico de ${GITHUB_SHA}. Publicar no catalogo com o SQL do resumo do job." \
-            --latest
+            --notes "Build automatico de ${GITHUB_SHA}. Publicar no catalogo com o SQL do resumo do job. Este release NAO contem instalador." \
+            --latest=false
 
           URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${AGENT_VERSION}/acessofast-agent.exe"
 
