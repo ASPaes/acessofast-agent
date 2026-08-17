@@ -1,0 +1,150 @@
+name: Build AcessoFast Installer (Windows)
+run-name: "Instalador — agente ${{ inputs.agent_version }}"
+
+# Monta o AcessoFastSetup.exe (Inno Setup) juntando as tres pecas que ja existem
+# separadas: o SCRIPT (installer/*.iss + installer/branding, versionados aqui), o
+# AGENTE (release assinado do build-agent.yml) e o CLIENTE branded (artifact do
+# build-client.yml). Ate 17/08/2026 essa juncao era feita a mao, numa unica maquina
+# com o projeto em C:\AcessoFast-Installer — se aquela maquina sumisse, sumia junto
+# a capacidade de gerar instalador.
+#
+# So dispatch manual: gerar instalador e decisao, nao consequencia de um push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_version:
+        description: "Tag do release do agente (ex: 2026.08.17-46a6109). Vazio = ultimo release do agente."
+        required: false
+        default: ""
+      client_run_id:
+        description: "Run id do build-client.yml de onde baixar o cliente. Vazio = ultimo build bem-sucedido."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read   # necessario pro gh run download buscar o artifact do cliente
+
+jobs:
+  build:
+    name: Montar AcessoFastSetup.exe
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Localizar o script do Inno
+        id: iss
+        shell: pwsh
+        run: |
+          $iss = Get-ChildItem installer -Filter *.iss -File | Select-Object -First 1
+          if (-not $iss) {
+            Write-Host "::error::Nenhum .iss em installer/. Suba o projeto do instalador (script + branding) pro repo."
+            exit 1
+          }
+          "path=$($iss.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "::notice::script=$($iss.Name)"
+
+      # O agente vem do RELEASE (publico e permanente), nao do artifact: e o mesmo
+      # binario que a frota recebe pelo auto-update, entao instalador e auto-update
+      # entregam exatamente a mesma versao.
+      - name: Baixar o agente
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ inputs.agent_version }}".Trim()
+          if (-not $v) {
+            # Releases do agente sao AAAA.MM.DD-<sha7>; os do instalador sao vX.Y.Z.
+            # O filtro evita pegar um release de instalador como se fosse agente.
+            $v = gh release list --repo $env:GITHUB_REPOSITORY --limit 30 --json tagName `
+                 | ConvertFrom-Json `
+                 | Where-Object { $_.tagName -match '^\d{4}\.\d{2}\.\d{2}-' } `
+                 | Select-Object -First 1 -ExpandProperty tagName
+          }
+          if (-not $v) { Write-Host "::error::Nenhum release de agente encontrado."; exit 1 }
+          Write-Host "::notice::agente=$v"
+          "AGENT_VERSION=$v" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force -Path installer\payload | Out-Null
+          gh release download $v --repo $env:GITHUB_REPOSITORY --pattern acessofast-agent.exe --dir installer\payload
+          if (-not (Test-Path installer\payload\acessofast-agent.exe)) {
+            Write-Host "::error::Release $v nao tem o asset acessofast-agent.exe."
+            exit 1
+          }
+          "sha256 do agente: $((Get-FileHash installer\payload\acessofast-agent.exe -Algorithm SHA256).Hash)"
+
+      # O cliente branded so existe como artifact do build-client.yml (30 dias de
+      # retencao). Expirou -> rodar o build-client antes; a mensagem diz isso.
+      - name: Baixar o cliente branded
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $runId = "${{ inputs.client_run_id }}".Trim()
+          if (-not $runId) {
+            $runId = gh run list --repo $env:GITHUB_REPOSITORY --workflow build-client.yml `
+                     --status success --limit 1 --json databaseId `
+                     | ConvertFrom-Json | Select-Object -First 1 -ExpandProperty databaseId
+          }
+          if (-not $runId) {
+            Write-Host "::error::Nenhum build-client.yml bem-sucedido. Rode o Build AcessoFast Client (Windows) primeiro (~48 min)."
+            exit 1
+          }
+          Write-Host "::notice::cliente vem do run $runId"
+          gh run download $runId --repo $env:GITHUB_REPOSITORY -n acessofast-client-windows-x64 --dir client
+          $exe = Get-ChildItem client -Recurse -File -Filter *.exe | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "::error::Artifact do run $runId sem .exe — o artifact pode ter expirado (30 dias). Rode o build-client de novo ou informe outro run id."
+            exit 1
+          }
+          # O .iss espera este nome exato dentro do payload.
+          Copy-Item $exe.FullName installer\payload\AcessoFastClient.exe -Force
+          "cliente: $($exe.Name) -> AcessoFastClient.exe"
+
+      - name: Garantir o Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "::notice::Inno Setup ausente na imagem — instalando via choco"
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { Write-Host "::error::ISCC.exe nao encontrado apos a instalacao."; exit 1 }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Compilar
+        shell: pwsh
+        run: |
+          & "$env:ISCC" "${{ steps.iss.outputs.path }}"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::ISCC falhou (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
+          $setup = Get-ChildItem installer\Output -Filter *.exe -File | Select-Object -First 1
+          if (-not $setup) { Write-Host "::error::ISCC terminou sem gerar .exe em installer\Output."; exit 1 }
+          "SETUP_PATH=$($setup.FullName)" >> $env:GITHUB_ENV
+          "gerado: $($setup.Name)  $([math]::Round($setup.Length/1MB,1)) MB"
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: acessofast-installer-windows-x64
+          path: installer/Output/*.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      # O instalador NAO sai como release automatico, ao contrario do agente. Ele e
+      # o download publico do site (releases/latest/download/AcessoFastSetup.exe),
+      # entao publicar precisa ser ato deliberado: um release proprio, marcado como
+      # latest. Release automatico aqui roubaria esse ponteiro sem ninguem pedir.
+      - name: Resumo
+        shell: pwsh
+        run: |
+          @"
+          ## Instalador gerado
+
+          - agente embutido: **$env:AGENT_VERSION**
+          - baixe em **Artifacts -> acessofast-installer-windows-x64** (no topo desta pagina)
+
+          Para publicar no site: crie um release novo (ex.: ``v3.1.1``) com o
+          ``AcessoFastSetup.exe`` e deixe marcado como **latest** — o /baixar serve
+          ``releases/latest/download/AcessoFastSetup.exe``.
+          "@ >> $env:GITHUB_STEP_SUMMARY
