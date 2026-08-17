@@ -45,7 +45,7 @@
 ; (release 2026.08.15-f602a40, sha256 6d95b4af...e0e0cb). A partir deste
 ; instalador, maquina nova nunca mais precisa de sessao remota so por versao
 ; de agente: ela se declara no painel e obedece ao alvo de update.
-#define MyAppVersion     "3.1.0"
+#define MyAppVersion     "3.1.1"
 #define MyAppPublisher   "ASP Softwares"
 #define MyAppURL         "https://acessofast.com.br"
 #define AgentServiceName "AcessoFastAgent"
