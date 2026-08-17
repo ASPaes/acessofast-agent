@@ -210,6 +210,12 @@ func finalizeMatricula(stop <-chan struct{}, rid string, st enrollState, nonceHa
 			}
 			_ = os.Remove(enrollStateFile)
 			logln("matricula: ADOTADO — credencial persistida; matricula concluida")
+			// A adocao acabou de criar o device no painel. So AGORA o reporte da senha
+			// e aceito (antes disso levava 404), e o painel esta SEM senha nenhuma: a
+			// adocao nao provisiona mais senha justamente pra nao servir uma senha que
+			// nunca esteve nesta maquina. Publica na hora — sem isto o tecnico esperaria
+			// o tick do rotateRetryLoop pra conseguir o primeiro acesso.
+			go publishSecretAfterAdoption()
 			return
 		case "waiting":
 			// segue esperando (o tailer ja esta ativo com o token pendente)

@@ -36,9 +36,22 @@ import (
 )
 
 const (
-	rotateURL         = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/rotate-device-secret"
-	pendingFile       = baseDir + `\rotate.pending` // senha JA aplicada no endpoint aguardando confirmacao do painel
-	rotateRetryPeriod = 30 * time.Second
+	rotateURL   = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/rotate-device-secret"
+	pendingFile = baseDir + `\rotate.pending` // senha JA aplicada no endpoint aguardando confirmacao do painel
+
+	// Cadencia do reenvio da pendencia, escalonada pelo tempo que ela esta aberta.
+	// O caso comum e a INSTALACAO NOVA: o rotate-on-boot aplica a senha antes de a
+	// maquina ser adotada, o painel recusa o reporte (404 device_not_registered) e a
+	// pendencia fica aberta ate a adocao. Nesse intervalo o painel nao tem senha
+	// nenhuma e o tecnico ve "aguardando" na tela — por isso o inicio e curto (5s;
+	// antes era 30s fixo, e o tecnico ficava abrindo e fechando a tela).
+	// Depois afrouxa: uma maquina instalada e nunca adotada nao pode ficar batendo
+	// na edge function a cada 5s pra sempre.
+	rotateRetryFast    = 5 * time.Second
+	rotateRetrySlow    = 30 * time.Second
+	rotateRetryIdle    = 5 * time.Minute
+	rotateRetryFastFor = 2 * time.Minute
+	rotateRetrySlowFor = 10 * time.Minute
 
 	// holdFile (§4.3): "hold de manutencao". Timestamp RFC3339; enquanto now<hold_until,
 	// o rotate-on-boot (§3.2) e suprimido (reboot planejado — a sessao pode voltar
@@ -261,31 +274,91 @@ func restartClientService() {
 	logln("CUT: servico %s reiniciado — sessao derrubada, senha nova ativa", clientServiceName)
 }
 
+// flushPending reenvia ao painel a senha pendente (JA aplicada no endpoint).
+// true = nao ha mais pendencia: ou nao havia nada a enviar, ou o painel confirmou.
+func flushPending() bool {
+	if token == "" || rustdeskID == "" {
+		return false // sem credencial o painel rejeitaria; nao gasta chamada
+	}
+	rotateMu.Lock()
+	defer rotateMu.Unlock()
+	pw := readPending() // le sob lock: rotateNow pode ter limpado/atualizado
+	if pw == "" {
+		return true
+	}
+	if reportRotation(pw) {
+		clearPending()
+		logln("ROTATE pendencia confirmada pelo painel")
+		return true
+	}
+	return false
+}
+
+// publishSecretAfterAdoption roda quando a matricula confirma a adocao (matricula.go).
+// Ate esse momento o painel RECUSAVA o reporte (device inexistente -> 404), entao a
+// senha que o agente aplicou no boot esta so na maquina e o painel nao tem senha
+// nenhuma. Publicamos na hora, sem esperar o tick do retry — e o que faz o primeiro
+// acesso funcionar de primeira. Sem pendencia (o --password do boot falhou ou o
+// rotate-on-boot nem rodou), rotaciona agora: e o unico jeito de o painel passar a
+// conhecer a senha desta maquina.
+func publishSecretAfterAdoption() {
+	if readPending() != "" {
+		if !flushPending() {
+			logln("ROTATE pos-adocao: painel nao confirmou a pendencia (o retry segue tentando)")
+		}
+		return
+	}
+	logln("ROTATE pos-adocao: sem pendencia — rotacionando pra publicar a senha no painel")
+	rotateNow()
+}
+
 // rotateRetryLoop reenvia a senha pendente ate o painel confirmar. Roda ate stop.
 // Tambem cobre a pendencia deixada por um run anterior que caiu antes de confirmar.
+// O ticker e curto e a decisao de reenviar sai do intervalo escalonado (ver as
+// constantes rotateRetry*): sem pendencia o tick e um stat de arquivo e nada mais.
 func rotateRetryLoop(stop <-chan struct{}) {
-	flush := func() {
-		if readPending() == "" || token == "" || rustdeskID == "" {
-			return
-		}
-		rotateMu.Lock()
-		defer rotateMu.Unlock()
-		pw := readPending() // re-le sob lock: rotateNow pode ter limpado/atualizado
-		if pw != "" && reportRotation(pw) {
-			clearPending()
-			logln("ROTATE pendencia confirmada pelo painel")
+	var pendenteDesde time.Time   // quando esta pendencia foi vista pela 1a vez
+	var ultimaTentativa time.Time // ultimo reporte tentado (zero = nenhum ainda)
+
+	intervalo := func() time.Duration {
+		aberta := time.Since(pendenteDesde)
+		switch {
+		case aberta < rotateRetryFastFor:
+			return rotateRetryFast
+		case aberta < rotateRetrySlowFor:
+			return rotateRetrySlow
+		default:
+			return rotateRetryIdle
 		}
 	}
 
-	flush() // tenta imediatamente ao subir
-	t := time.NewTicker(rotateRetryPeriod)
+	tick := func() {
+		if readPending() == "" {
+			pendenteDesde = time.Time{}
+			return
+		}
+		if pendenteDesde.IsZero() {
+			pendenteDesde = time.Now()
+			ultimaTentativa = time.Time{}
+		}
+		if !ultimaTentativa.IsZero() && time.Since(ultimaTentativa) < intervalo() {
+			return
+		}
+		ultimaTentativa = time.Now()
+		if flushPending() {
+			pendenteDesde = time.Time{}
+		}
+	}
+
+	tick() // tenta imediatamente ao subir
+	t := time.NewTicker(rotateRetryFast)
 	defer t.Stop()
 	for {
 		select {
 		case <-stop:
 			return
 		case <-t.C:
-			flush()
+			tick()
 		}
 	}
 }
