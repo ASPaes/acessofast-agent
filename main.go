@@ -38,7 +38,6 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/mgr"
 )
 
 // ---------------------------------------------------------------------------
@@ -284,6 +283,12 @@ type tailer struct {
 	primed bool
 	open   map[string]time.Time // #N aberto -> instante em que vimos o "opened"
 
+	// pending: sobra da ultima leitura SEM "\n" no fim. O poll le o arquivo a cada 3s e
+	// pode cair no meio de uma linha que o cliente ainda esta escrevendo; sem guardar o
+	// pedaco, um "#N Connection closed" partido virava dois fragmentos, nenhum casava
+	// com o regex e a sessao ficava presa (fantasma). Ver fatiaLinhas().
+	pending string
+
 	// graceUntil (§3.1): quando o conjunto de #N esvazia, arma-se o prazo de carencia.
 	// Zero = desarmado. Uma reconexao antes do prazo cancela; o prazo estourando vazio
 	// dispara o fim de sessao adiado (postEvent("end") + rotateNow) via checkGrace().
@@ -308,6 +313,12 @@ type tailer struct {
 	// por isso o start inicial vai sem ele e re-postamos start ao aprender o peer_id.
 	// Limpo no fim real da sessao (nao vaza pro proximo atendimento).
 	controllerID string
+
+	// semSocketDesde: instante em que o cliente branded passou a NAO ter nenhum socket
+	// de sessao, com #N ainda aberto. Zero = ha socket (ou nao houve leitura confiavel).
+	// Segunda fonte fora do log, como clientStart: se o "closed" se perdeu de vez, o
+	// socket e quem prova que a sessao acabou. Ver checkSessaoViva() em sessao_socket.go.
+	semSocketDesde time.Time
 }
 
 // clientProcStartTime devolve o horario de inicio do processo do servico do cliente
@@ -315,21 +326,11 @@ type tailer struct {
 // cairam) de rotacao benigna (conexoes seguem). (time.Time{}, false) se indisponivel
 // (servico parado, sem permissao): nesse caso o detector nao age.
 func clientProcStartTime() (time.Time, bool) {
-	m, err := mgr.Connect()
-	if err != nil {
+	pid, ok := clientProcPID()
+	if !ok {
 		return time.Time{}, false
 	}
-	defer m.Disconnect()
-	s, err := m.OpenService(clientServiceName)
-	if err != nil {
-		return time.Time{}, false
-	}
-	defer s.Close()
-	st, err := s.Query()
-	if err != nil || st.ProcessId == 0 {
-		return time.Time{}, false
-	}
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, st.ProcessId)
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -475,6 +476,83 @@ func (t *tailer) expireStale() {
 	}
 }
 
+// maxPendingBytes: teto do buffer de linha parcial. Uma linha do cliente nao passa de
+// alguns KB; acima disso e sinal de arquivo estranho (binario, escrita sem newline) e
+// segurar aquilo indefinidamente so consumiria memoria.
+const maxPendingBytes = 64 << 10
+
+// fatiaLinhas junta a sobra da leitura anterior ao pedaco novo e devolve SO as linhas
+// completas, guardando de volta o que ficou sem "\n". Sem isto o poll de 3s cortava
+// linhas ao meio: os dois fragmentos passavam pelos regex sem casar e o evento (em
+// especial o "#N Connection closed") sumia de vez.
+func (t *tailer) fatiaLinhas(chunk string) []string {
+	buf := t.pending + chunk
+	t.pending = ""
+	if buf == "" {
+		return nil
+	}
+	i := strings.LastIndexByte(buf, '\n')
+	if i < 0 {
+		if len(buf) > maxPendingBytes {
+			logln("WARN linha parcial acima de %d bytes — buffer descartado", maxPendingBytes)
+			return nil
+		}
+		t.pending = buf // nada completo ainda; espera o proximo tick
+		return nil
+	}
+	if resto := buf[i+1:]; len(resto) <= maxPendingBytes {
+		t.pending = resto
+	} else {
+		logln("WARN sobra parcial acima de %d bytes — buffer descartado", maxPendingBytes)
+	}
+	return strings.Split(buf[:i], "\n")
+}
+
+// tailRotacionado devolve o que ficou no arquivo ANTIGO a partir de 'from'. O cliente
+// rotaciona renomeando o _rCURRENT.log e criando um novo no lugar, entao o trecho
+// escrito entre o nosso ultimo poll e o rename so existe no irmao renomeado. Pega o
+// AcessoFast_r*.log mais recente do mesmo diretorio que nao seja o proprio _rCURRENT;
+// "" quando nao ha nada a recuperar.
+func tailRotacionado(cur string, from int64) string {
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(cur), "AcessoFast_r*.log"))
+	var best string
+	var bestT time.Time
+	for _, m := range matches {
+		if strings.EqualFold(m, cur) {
+			continue
+		}
+		fi, err := os.Stat(m)
+		if err != nil || !fi.ModTime().After(bestT) {
+			continue
+		}
+		bestT, best = fi.ModTime(), m
+	}
+	// So aceita rotacionado recem-fechado: um arquivo velho aqui seria historico, e
+	// reprocessar historico reabriria #N ja encerrado. 10 min cobre de sobra a distancia
+	// entre o rename e o nosso poll de 3s.
+	if best == "" || time.Since(bestT) > 10*time.Minute {
+		return ""
+	}
+	fi, err := os.Stat(best)
+	if err != nil || fi.Size() <= from {
+		return ""
+	}
+	f, err := os.Open(best)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	if _, err := f.Seek(from, io.SeekStart); err != nil {
+		return ""
+	}
+	data, err := io.ReadAll(f)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	logln("rotacao: recuperando %d byte(s) da cauda de %s", len(data), filepath.Base(best))
+	return string(data)
+}
+
 func (t *tailer) poll() {
 	// Restart do cliente (reboot/crash/restart manual/corte): o processo do servico troca
 	// de horario de inicio -> TODAS as conexoes cairam, e o "#N closed" NAO e logado num
@@ -509,13 +587,26 @@ func (t *tailer) poll() {
 		t.path = p
 		t.offset = 0
 		t.primed = false
+		t.pending = ""
 	}
 	fi, err := os.Stat(p)
 	if err != nil {
 		return
 	}
 	if fi.Size() < t.offset { // rotacionou/truncou
+		// A cauda do arquivo ANTIGO (o que o cliente escreveu entre o ultimo poll e o
+		// rename) sairia de cena junto com ele. E exatamente ali que um "#N Connection
+		// closed" se perde e a sessao vira fantasma — entao recuperamos antes de zerar.
+		// Nao primado nao chega aqui (offset 0 nunca e maior que o tamanho).
+		if t.primed {
+			for _, ln := range t.fatiaLinhas(tailRotacionado(p, t.offset)) {
+				if ln != "" {
+					t.processLine(ln)
+				}
+			}
+		}
 		t.offset = 0
+		t.pending = "" // o resto parcial era do arquivo antigo
 		// NAO limpa t.open nem re-prima: as conexoes abertas atravessam a
 		// rotacao; so voltamos a ler o novo arquivo do inicio.
 		logln("log rotacionou; relendo do novo arquivo (abertas: %d)", len(t.open))
@@ -529,7 +620,7 @@ func (t *tailer) poll() {
 	data, _ := io.ReadAll(f)
 	t.offset += int64(len(data))
 
-	lines := strings.Split(string(data), "\n")
+	lines := t.fatiaLinhas(string(data))
 	if !t.primed {
 		// Reconstrucao de estado no boot: reproduz opened/closed do arquivo
 		// atual SEM postar eventos historicos. Se sobrar #N aberto, ha sessao
@@ -630,8 +721,9 @@ func worker(stop <-chan struct{}) {
 			return
 		case <-pollT.C:
 			t.poll()
-			t.checkGrace()   // §3.1: fecha a sessao adiada quando a carencia expira
-			t.checkHardCap() // B2: corta o free ao vencer o cap de 2h
+			t.checkSessaoViva() // fantasma: #N preso sem socket de sessao -> encerra
+			t.checkGrace()      // §3.1: fecha a sessao adiada quando a carencia expira
+			t.checkHardCap()    // B2: corta o free ao vencer o cap de 2h
 		case <-hbT.C:
 			if len(t.open) > 0 {
 				// Re-arma o cap se a resposta trouxer hard_cap_at; falha transitoria de
