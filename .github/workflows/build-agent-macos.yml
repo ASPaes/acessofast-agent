@@ -1,0 +1,195 @@
+name: Build AcessoFast Agent (macOS)
+run-name: "AcessoFast Agent macOS — ${{ github.sha }}"
+
+# Compila o agente pra macOS (arm64 + Intel) num binario universal.
+#
+# POR QUE UM ARQUIVO SEPARADO, e nao um job dentro do build-agent.yml:
+#   o build-agent.yml sustenta a frota Windows em producao — ele publica o release
+#   assinado que alimenta o auto-update. Um job macOS ali dentro deixaria a run
+#   INTEIRA vermelha quando o lado Mac quebrasse, e a leitura no GitHub viraria "o
+#   build do agente quebrou". Separado, o macOS falha sozinho, sem contaminar o
+#   sinal do que ja esta em producao.
+#
+# POR QUE RUNNER macOS e nao cross-compile do ubuntu (que o Go faria em segundos):
+#   1. lipo, pra fundir arm64 + amd64 num binario universal — so existe no macOS;
+#   2. codesign — em Apple Silicon o sistema MATA binario sem assinatura nenhuma,
+#      entao assinar nao e cosmetico como no Windows, e requisito pra rodar.
+#   Runner macOS e gratuito neste repo porque ele e publico.
+#
+# ESTE BUILD NAO PUBLICA RELEASE, de proposito. O do Windows publica porque o
+# auto-update consome dele. Aqui seria cedo por dois motivos: os caminhos do cliente
+# branded no macOS ainda estao por confirmar em maquina real (ver o bloco
+# "A CONFIRMAR" no topo do plat_darwin.go), e a assinatura Developer ID ainda nao
+# existe. Publicar agora criaria um release que o catalogo poderia servir pra uma
+# maquina de cliente. Enquanto isso, o artifact serve pro teste em Mac.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-agent-macos.yml"
+
+permissions:
+  # read, e nao write: este workflow nao cria tag nem release. Quando o macOS entrar
+  # em producao, a mudanca pra write e deliberada e vem junto do passo de release.
+  contents: read
+
+jobs:
+  build:
+    name: Universal (arm64 + Intel)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go (versao do go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Baixar dependencias
+        run: go mod download
+
+      # Mesmo papel do vet do build Windows: compila pro alvo real e pega erro de
+      # tipo/build. As DUAS arquiteturas, porque o binario universal so e util se as
+      # duas compilarem — e um erro de tamanho de tipo apareceria so numa delas.
+      - name: Vet (darwin arm64 e amd64)
+        run: |
+          set -euo pipefail
+          GOOS=darwin GOARCH=arm64 go vet ./...
+          GOOS=darwin GOARCH=amd64 go vet ./...
+
+      - name: Build universal
+        env:
+          ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w"
+          if [ -n "${ANON_KEY:-}" ]; then
+            LDFLAGS="$LDFLAGS -X main.anonKey=${ANON_KEY}"
+            echo "::notice::anonKey injetado via repo Variable SUPABASE_ANON_KEY"
+          else
+            echo "::notice::SUPABASE_ANON_KEY vazio — usando o fallback hardcoded do main.go (mesma chave)"
+          fi
+
+          # MESMO formato de versao do build Windows (AAAA.MM.DD-sha7). Nao e
+          # cosmetico: o painel ordena builds comparando string, sem semver, e um
+          # formato diferente por plataforma quebraria essa ordenacao.
+          VERSION="$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
+          LDFLAGS="$LDFLAGS -X main.version=${VERSION}"
+          echo "::notice::version=${VERSION}"
+          echo "AGENT_VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+          for arch in arm64 amd64; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+              go build -trimpath -ldflags "$LDFLAGS" -o "acessofast-agent-$arch" .
+          done
+
+          # Um binario so, que roda nativo em Apple Silicon e em Mac Intel. O
+          # instalador leva um arquivo unico e nao precisa escolher arquitetura na
+          # maquina do cliente.
+          lipo -create -output acessofast-agent \
+            acessofast-agent-arm64 acessofast-agent-amd64
+          rm -f acessofast-agent-arm64 acessofast-agent-amd64
+          lipo -info acessofast-agent
+
+      # O lipo INVALIDA a assinatura que o proprio linker do Go poe no binario
+      # arm64 — o resultado da fusao nasce sem assinatura valida, e em Apple Silicon
+      # isso e binario que o sistema recusa executar. Por isso assinamos aqui, depois
+      # da fusao, sempre.
+      #
+      # Com o certificado (secret presente): Developer ID + hardened runtime +
+      # timestamp, que e o que a notarizacao exige mais tarde.
+      # Sem o certificado: assinatura ad-hoc, que faz o binario RODAR na maquina mas
+      # NAO passa pelo Gatekeeper quando baixado da internet. Serve pro teste local,
+      # nao pra distribuir.
+      - name: Assinar
+        env:
+          P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          SIGN_IDENTITY: ${{ vars.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${P12_BASE64:-}" ]; then
+            echo "::warning::MACOS_DEVELOPER_ID_P12 ausente — assinando AD-HOC. O binario roda em Apple Silicon, mas NAO passa no Gatekeeper: nao distribua este artifact pra cliente."
+            codesign --force --sign - acessofast-agent
+          else
+            # Keychain temporario: a chave privada nao pode encostar no chaveiro
+            # padrao do runner nem sobreviver ao job.
+            KEYCHAIN="$RUNNER_TEMP/assinatura.keychain-db"
+            KEYCHAIN_PW="$(uuidgen)"
+            security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+            security set-keychain-settings -lut 900 "$KEYCHAIN"
+            security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+
+            echo "$P12_BASE64" | openssl base64 -d -A -out "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+              -P "$P12_PASSWORD" -T /usr/bin/codesign
+            rm -f "$RUNNER_TEMP/cert.p12"
+            # Sem isto o codesign para pedindo senha do chaveiro — e num runner sem
+            # ninguem pra responder, o job trava ate o timeout.
+            security set-key-partition-list -S apple-tool:,apple: \
+              -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+            security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+            IDENT="${SIGN_IDENTITY:-Developer ID Application}"
+            echo "::notice::assinando com: $IDENT"
+            codesign --force --options runtime --timestamp \
+              --sign "$IDENT" acessofast-agent
+          fi
+
+          codesign --verify --verbose=2 acessofast-agent
+
+      # Guarda equivalente a do build Windows (que confere o header MZ): garante que
+      # saiu Mach-O universal com as duas arquiteturas, e nao um binario de uma so
+      # por o lipo ter falhado silenciosamente.
+      - name: Sanidade — Mach-O universal com as duas arquiteturas?
+        run: |
+          set -euo pipefail
+          info="$(lipo -info acessofast-agent)"
+          echo "$info"
+          for arch in arm64 x86_64; do
+            case "$info" in
+              *"$arch"*) ;;
+              *) echo "::error::binario sem a arquitetura $arch"; exit 1 ;;
+            esac
+          done
+          file acessofast-agent | grep -q "Mach-O" || {
+            echo "::error::saida nao e Mach-O"; exit 1; }
+          echo "OK: universal (arm64 + x86_64)."
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: acessofast-agent-macos-universal
+          path: acessofast-agent
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Resumo
+        run: |
+          {
+            echo "## Agente macOS ${AGENT_VERSION}"
+            echo
+            echo "Baixe em **Artifacts -> acessofast-agent-macos-universal** (no topo desta pagina)."
+            echo
+            echo "### Este build NAO foi publicado como release"
+            echo
+            echo "Enquanto isso valer, nenhuma maquina Mac recebe este binario pelo auto-update."
+            echo "Faltam duas coisas, nesta ordem:"
+            echo
+            echo "1. **Confirmar os caminhos do cliente branded no macOS** — ver o bloco"
+            echo "   \`A CONFIRMAR EM MAQUINA REAL\` no topo do \`plat_darwin.go\`. A deteccao"
+            echo "   de sessao inteira depende de achar o log certo; errar o caminho faz o"
+            echo "   agente ficar cego, e o sintoma e tudo parecer funcionar e nada ser faturado."
+            echo "2. **Certificado Developer ID** — sem ele a assinatura acima e ad-hoc, que roda"
+            echo "   na maquina mas nao passa no Gatekeeper depois de baixada da internet."
+            echo
+            echo "Quando os dois estiverem resolvidos, o release entra no catalogo com"
+            echo "\`platform = 'darwin'\` (a coluna ja existe em \`agent_releases\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
