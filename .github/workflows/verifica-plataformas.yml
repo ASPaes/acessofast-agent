@@ -1,0 +1,94 @@
+name: Verificacao (Windows + macOS)
+run-name: "Verificacao — ${{ github.ref_name }}"
+
+# O PORTAO do agente compartilhado.
+#
+# Windows e macOS saem do mesmo fonte: a regra (deteccao de sessao, matricula,
+# rotacao da senha efemera, auto-update) vive em codigo comum, e so o que encosta no
+# sistema tem duas versoes (plat_windows.go / plat_darwin.go). Isso e o que faz um
+# conserto valer pros dois de uma vez — o consertado no fantasma de 18/08 nao pode
+# precisar ser feito duas vezes, porque no dia em que alguem fizer so de um lado, uma
+# das plataformas volta a faturar errado em silencio.
+#
+# O preco de compartilhar e este arquivo: alguem mexe pensando num SO e quebra o
+# outro sem perceber. Entao aqui, em TODO push de branch e TODO pull request, os dois
+# sistemas sao compilados e testados de verdade — cada um na sua maquina.
+#
+# POR QUE MATRIZ COM DUAS MAQUINAS, e nao um runner so cross-compilando:
+#   cross-compilar prova que COMPILA, nao que FUNCIONA. Os testes marcados com build
+#   tag (os caminhos de credencial de cada SO, por exemplo) so EXECUTAM no sistema
+#   deles. Rodando so no Linux, esses testes nunca rodariam, e a trava seria decorativa.
+#
+# fail-fast desligado de proposito: quero ver o resultado dos DOIS, sempre. Parar no
+# primeiro erro esconderia se o outro tambem quebrou.
+#
+# Nao ha checagem de gofmt aqui: o working tree deste repo e CRLF, e o gofmt acusa
+# todo arquivo por causa disso. Uma trava que acusa 100% dos arquivos nao trava nada.
+
+on:
+  pull_request:
+  push:
+    # A main tem os workflows de build proprios (build-agent.yml e
+    # build-agent-macos.yml), que ja compilam tudo. Aqui e o de ANTES do merge.
+    branches-ignore: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verifica:
+    name: ${{ matrix.nome }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            nome: Windows
+          - os: macos-latest
+            nome: macOS
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go (versao do go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Os TRES alvos que o produto tem, checados nas duas maquinas. Assim, mexer no
+      # lado Windows e esquecer o par no plat_darwin.go quebra o PR na hora — que e
+      # o momento barato de descobrir, e nao depois do merge.
+      - name: Compila os tres alvos (windows, macOS arm64, macOS Intel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOOS=windows GOARCH=amd64 go vet ./...
+          echo "  ok  windows/amd64"
+          GOOS=darwin GOARCH=arm64 go vet ./...
+          echo "  ok  darwin/arm64"
+          GOOS=darwin GOARCH=amd64 go vet ./...
+          echo "  ok  darwin/amd64"
+
+      # Nativo, e por isso a matriz existe: aqui rodam tambem os testes com build tag
+      # deste sistema — no Windows, a trava dos caminhos em C:\ProgramData; no macOS,
+      # a de /Library/Application Support e a do rotulo do LaunchDaemon.
+      - name: Testes (nativos deste sistema)
+        shell: bash
+        run: go test ./... -v
+
+      # Prova que o binario deste sistema realmente sai. O vet compila os pacotes; o
+      # build produz o executavel de verdade, com o linker no meio.
+      - name: Binario deste sistema
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o agente-verificacao.exe .
+            ls -la agente-verificacao.exe
+          else
+            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o agente-verificacao .
+            ls -la agente-verificacao
+          fi

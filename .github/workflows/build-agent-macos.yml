@@ -64,6 +64,12 @@ jobs:
           GOOS=darwin GOARCH=arm64 go vet ./...
           GOOS=darwin GOARCH=amd64 go vet ./...
 
+      # Roda nativo: aqui, e so aqui, executam os testes marcados com //go:build
+      # darwin — a trava dos caminhos de credencial do Mac e a do rotulo do
+      # LaunchDaemon, que e contrato com o .plist do instalador.
+      - name: Testes (darwin, nativos)
+        run: go test ./...
+
       - name: Build universal
         env:
           ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}

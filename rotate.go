@@ -49,7 +49,6 @@ const (
 	rotateRetryIdle    = 5 * time.Minute
 	rotateRetryFastFor = 2 * time.Minute
 	rotateRetrySlowFor = 10 * time.Minute
-
 )
 
 // Caminhos derivados do baseDir, que e por plataforma (plat_windows.go / plat_darwin.go).

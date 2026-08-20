@@ -172,12 +172,10 @@ func clientProcStartTime() (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
-	// lstart sai como "Wed Aug 20 08:14:33 2026", no fuso local da maquina.
-	t, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", strings.TrimSpace(string(out)), time.Local)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
+	// lstart sai como "Wed Aug 20 08:14:33 2026", no fuso local da maquina. A
+	// interpretacao vive em saida_macos.go, de proposito SEM build tag: assim ela
+	// tem teste rodando em qualquer maquina, e nao so num Mac.
+	return parseLstart(string(out), time.Local)
 }
 
 // restartClientService reinicia o LaunchDaemon do cliente branded. Billing B2: e o
@@ -227,32 +225,11 @@ func socketsDeSessao(pid uint32) (int, bool) {
 		return 0, false
 	}
 
-	total := 0
-	for _, linha := range strings.Split(string(out), "\n") {
-		if !strings.HasPrefix(linha, "n") {
-			continue
-		}
-		// Formato: n192.168.0.5:52341->203.0.113.9:21117
-		seta := strings.Index(linha, "->")
-		if seta < 0 {
-			continue // socket sem par remoto nao e sessao
-		}
-		remoto := linha[seta+2:]
-		i := strings.LastIndex(remoto, ":")
-		if i < 0 {
-			continue
-		}
-		porta, err := strconv.Atoi(strings.TrimSpace(remoto[i+1:]))
-		if err != nil {
-			continue
-		}
-		switch porta {
-		case portaNatTest, portaRendezvous:
-			continue // maquina ociosa falando com o servidor
-		}
-		total++
-	}
-	return total, true
+	// A CONTAGEM vive em saida_macos.go, de proposito SEM build tag. E a parte que
+	// erra EM SILENCIO — um socket a mais e a sessao nunca termina (fantasma), um a
+	// menos e a sessao de quem esta trabalhando cai. Fora da tag, ela tem teste
+	// rodando em qualquer maquina; sob a tag, so num Mac.
+	return contaSocketsSessao(string(out)), true
 }
 
 // ---------------------------------------------------------------------------

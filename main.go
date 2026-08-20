@@ -1,7 +1,6 @@
 // AcessoFast — Agente de Sessao + Matriculador (binario unico).
 //
-// Sem argumentos          -> roda como servico do SO (Windows: SCM; macOS: launchd),
-//                            ou em console quando iniciado a mao.
+// Sem argumentos          -> roda como servico do SO (SCM no Windows, launchd no macOS).
 // Com --enroll            -> executa a matricula do endpoint UMA vez e sai.
 //
 // Deteccao de sessao: o agente faz tail do log do cliente branded (namespace
