@@ -369,7 +369,7 @@ func agendaRestart() error {
 	// Passar a data resolveria, mas o formato de /sd segue o locale do Windows
 	// (dd/MM/yyyy aqui, MM/dd/yyyy em outro) e errar isso agendaria pra data
 	// errada silenciosamente. Na virada do dia, entao, simplesmente nao agendamos:
-	// o proximo presence (60s) tenta de novo, ja no dia seguinte.
+	// o proximo 'presence' (60s) tenta de novo, ja no dia seguinte.
 	if quando.Day() != agora.Day() {
 		return errors.New("virada de dia: adiando o agendamento pro proximo presence")
 	}
