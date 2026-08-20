@@ -15,17 +15,28 @@
 // leitura do sistema muda aqui.
 //
 // ---------------------------------------------------------------------------
-// A CONFIRMAR EM MAQUINA REAL (marcado com "CONFIRMAR" em cada ponto)
+// COLETA DE CAMPO — 20/08/2026, MacBook Pro (macOS 26.5.2, arm64), RustDesk 1.4.9
 //
-// Os caminhos de config e de log do cliente branded no macOS estao aqui como
-// CANDIDATOS, deduzidos do fonte do RustDesk (em macOS ele usa ORG "com.carriez" +
-// APP_NAME, e o build branded troca o APP_NAME para AcessoFast). Nao foram vistos
-// em maquina Apple ainda.
+// O que ficou PROVADO em maquina real:
 //
-// Isso NAO e detalhe: a deteccao de sessao inteira depende de achar o log certo —
-// no Windows, escolher o log errado ja cegou o agente uma vez, e o sintoma foi
-// "tudo parece funcionar e nada e faturado". Enquanto o teste de campo nao
-// confirmar, tratar este arquivo como esqueleto, nao como pronto.
+//   - Os marcadores de sessao EXISTEM no macOS, no mesmo formato do Windows e
+//     vindos do mesmo lugar do fonte:
+//       [.. -03:00] DEBUG [src/server/connection.rs:1377] #899 Connection opened from 192.168.35.148:50328.
+//     A deteccao de sessao do agente vale nos dois sistemas.
+//
+//   - O log NAO fica numa subpasta "server", como no Windows. Fica na RAIZ de
+//     ~/Library/Logs/<AppName>/. As subpastas que existem (cm/, check-hwcodec-config/)
+//     NAO tem os marcadores.
+//
+//   - A config fica em ~/Library/Preferences/com.carriez.<AppName>/.
+//
+//   - O `ps` responde no IDIOMA da maquina: naquele Mac, "qui 20 ago 17:40:23 2026".
+//     Por isso o comando roda com LC_ALL=C (ver clientProcStartTime).
+//
+// AINDA POR CONFIRMAR: onde o log cai quando o cliente roda como SERVICO instalado.
+// Na coleta o app rodava a partir do DMG montado, sem servico nenhum registrado no
+// launchd — entao o que se viu foi o log da sessao do USUARIO. Por isso os globs
+// abaixo cobrem tambem /var/root, que e o home do root.
 // ---------------------------------------------------------------------------
 package main
 
@@ -73,8 +84,13 @@ const clientLogPattern = "AcessoFast_r*.log"
 // ---------------------------------------------------------------------------
 
 // clientConfigGlobs: onde procurar a config do cliente pra extrair o rustdesk_id.
-// CONFIRMAR em maquina real. /var/root e o home do root — e la que cai a config
-// quando quem roda e o daemon, o caso que interessa pra nos.
+//
+// Caminho CONFIRMADO em campo (20/08/2026): o RustDesk 1.4.9 no macOS grava em
+// ~/Library/Preferences/com.carriez.<AppName>/<AppName>.toml — no teste,
+// /Users/vinipaes/Library/Preferences/com.carriez.RustDesk/RustDesk.toml. O build
+// branded troca o AppName para AcessoFast, entao o formato abaixo e o mesmo.
+//
+// /var/root e o home do root: e la que a config cai quando quem roda e o daemon.
 func clientConfigGlobs() []string {
 	return []string{
 		"/var/root/Library/Preferences/com.carriez.AcessoFast/AcessoFast.toml",
@@ -84,14 +100,27 @@ func clientConfigGlobs() []string {
 	}
 }
 
-// clientServerLogGlobs: SO o log do lado "server" — a unica fonte dos marcadores de
-// conexao. CONFIRMAR em maquina real: e ESTE o caminho que o teste de campo precisa
-// responder antes de qualquer outra coisa. Sem o log certo o agente fica cego e a
-// sessao nunca e faturada.
+// clientServerLogGlobs: o log que carrega os marcadores de conexao.
+//
+// AQUI O macOS DIFERE DO WINDOWS, e a coleta de campo (20/08/2026) desmentiu o que
+// eu tinha deduzido. No Windows os marcadores so existem no log da subpasta
+// "server\", e o log da raiz e do lado que CONTROLA — por isso la a busca exige
+// server\. No macOS NAO EXISTE essa subpasta: o "#N Connection opened" sai no log da
+// RAIZ, ~/Library/Logs/<AppName>/<AppName>_rCURRENT.log.
+//
+// As subpastas que existem no macOS sao outras — cm/ (o gerenciador de conexoes, que
+// loga conn_id e nao os marcadores) e check-hwcodec-config/ (teste de codec) — e
+// nenhuma serve. Por isso o glob nomeia o ARQUIVO exato num nivel exato: qualquer
+// coisa dentro de subpasta fica de fora sozinha, sem precisar de filtro.
+//
+// Os dois caminhos: o do usuario logado (onde o cliente roda a sessao grafica) e o do
+// root (se o servico instalado gravar no home dele). O agente roda como root e le os
+// dois. Qual deles vale com o servico instalado ainda esta por confirmar — na coleta
+// o app rodava direto do DMG, sem servico registrado.
 func clientServerLogGlobs() []string {
 	return []string{
-		"/var/root/Library/Logs/AcessoFast/server/AcessoFast_rCURRENT.log",
-		"/Users/*/Library/Logs/AcessoFast/server/AcessoFast_rCURRENT.log",
+		"/var/root/Library/Logs/AcessoFast/AcessoFast_rCURRENT.log",
+		"/Users/*/Library/Logs/AcessoFast/AcessoFast_rCURRENT.log",
 	}
 }
 
@@ -168,7 +197,14 @@ func clientProcStartTime() (time.Time, bool) {
 	if !ok {
 		return time.Time{}, false
 	}
-	out, err := exec.Command("ps", "-o", "lstart=", "-p", strconv.FormatUint(uint64(pid), 10)).Output()
+	cmd := exec.Command("ps", "-o", "lstart=", "-p", strconv.FormatUint(uint64(pid), 10))
+	// LC_ALL=C NAO e enfeite. O ps responde no idioma da maquina, e o Mac do teste
+	// (pt-BR) devolveu "qui 20 ago 17:40:23 2026" — dia antes do mes, nomes em
+	// portugues. Sem forcar o idioma neutro, o parser falharia em toda maquina que
+	// nao esteja em ingles, ou seja, em praticamente todo cliente nosso. E o agente
+	// perderia o sinal de restart do cliente, deixando #N preso (fantasma).
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	out, err := cmd.Output()
 	if err != nil {
 		return time.Time{}, false
 	}

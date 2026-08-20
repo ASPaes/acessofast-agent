@@ -115,3 +115,34 @@ func TestParseLstart(t *testing.T) {
 		}
 	})
 }
+
+// PROVA DE CAMPO (20/08/2026): num MacBook em pt-BR, `ps -o lstart=` respondeu
+//
+//	qui 20 ago 17:40:23 2026
+//
+// com nomes em portugues e o dia ANTES do mes. Este teste fixa que o parser rejeita
+// isso — de proposito. A solucao nao e ensinar idiomas ao parser (seriam todos os do
+// mundo, e o formato tambem muda de ordem); e rodar o ps com LC_ALL=C, o que
+// clientProcStartTime faz.
+//
+// Se alguem um dia remover aquele LC_ALL=C achando que e enfeite, o agente para de
+// enxergar o restart do cliente em toda maquina que nao esteja em ingles — ou seja,
+// em praticamente todo cliente nosso — e a sessao fica presa como fantasma. Este
+// teste e o bilhete explicando isso.
+func TestParseLstartRejeitaSaidaLocalizada(t *testing.T) {
+	localizadas := []string{
+		"qui 20 ago 17:40:23 2026", // pt-BR, visto em campo
+		"jue 20 ago 17:40:23 2026", // es
+		"gio 20 ago 17:40:23 2026", // it
+	}
+	for _, s := range localizadas {
+		if _, ok := parseLstart(s, time.UTC); ok {
+			t.Errorf("parseLstart(%q) aceitou saida localizada — o parser assume LC_ALL=C", s)
+		}
+	}
+
+	// E a mesma máquina, com LC_ALL=C, responderia assim — que tem que passar.
+	if _, ok := parseLstart("Thu Aug 20 17:40:23 2026", time.UTC); !ok {
+		t.Error("parseLstart recusou a saida em C locale, que e a que o agente forca")
+	}
+}
