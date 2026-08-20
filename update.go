@@ -23,12 +23,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -43,10 +41,11 @@ import (
 // mesma chave, sempre.
 const updatePubKeyB64 = "IADLOND+FJeXkthXym/2AoPr6/336ITnC3TvOD1hGQs="
 
+// updateDir: onde o binario baixado espera ate ser verificado e trocado. Derivado do
+// baseDir, que e definido por plataforma (plat_windows.go / plat_darwin.go).
+var updateDir = filepath.Join(baseDir, "update")
+
 const (
-	updateDir = baseDir + `\update`
-	// Nome da tarefa que reinicia o servico depois da troca.
-	updateTaskName = "AcessoFastAgentRestart"
 	// Teto do download. O agente tem ~8 MB; 100 MB e folga larga que ainda impede
 	// um servidor hostil de encher o disco da maquina do cliente.
 	updateMaxBytes = 100 << 20
@@ -117,7 +116,7 @@ func baixaEConfere(u *updateInfo) (string, error) {
 	if err := os.MkdirAll(updateDir, 0755); err != nil {
 		return "", fmt.Errorf("mkdir %s: %w", updateDir, err)
 	}
-	dest := filepath.Join(updateDir, "acessofast-agent-"+u.Version+".exe")
+	dest := filepath.Join(updateDir, "acessofast-agent-"+u.Version+exeSuffix)
 	tmp := dest + ".part"
 	_ = os.Remove(tmp)
 
@@ -235,39 +234,10 @@ func trocaBinario(verificado string) error {
 	return nil
 }
 
-// agendaRestart marca o restart do servico pra daqui a pouco. O servico nao se
-// reinicia sozinho: quem chama o 'net stop' morre no meio do proprio comando, e o
-// 'net start' nunca roda. Por isso o restart sai de um processo de fora — a tarefa
-// agendada.
-//
+// agendaRestart (por plataforma) faz o agente voltar a subir ja no binario novo.
 // Falhar aqui NAO e grave e por isso o chamador so loga: o binario novo JA esta no
 // caminho certo, entao o proximo boot da maquina (ou qualquer restart do servico)
-// ja sobe na versao nova. A tarefa so antecipa isso.
-func agendaRestart() error {
-	agora := time.Now()
-	quando := agora.Add(2 * time.Minute)
-	// Sem /sd (data), o schtasks assume hoje — e recusa uma hora que ja passou.
-	// Passar a data resolveria, mas o formato de /sd segue o locale do Windows
-	// (dd/MM/yyyy aqui, MM/dd/yyyy em outro) e errar isso agendaria pra data
-	// errada silenciosamente. Na virada do dia, entao, simplesmente nao agendamos:
-	// o proximo 'presence' (60s) tenta de novo, ja no dia seguinte.
-	if quando.Day() != agora.Day() {
-		return errors.New("virada de dia: adiando o agendamento pro proximo presence")
-	}
-	cmd := exec.Command("schtasks", "/create",
-		"/tn", updateTaskName,
-		"/tr", `cmd /c net stop `+serviceName+` & net start `+serviceName,
-		"/sc", "once",
-		"/st", quando.Format("15:04"),
-		"/ru", "SYSTEM",
-		"/rl", "HIGHEST",
-		"/f",
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("schtasks: %v (%s)", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
+// ja sobe na versao nova. O agendamento so antecipa isso.
 
 // motivoPular decide se um manifesto deve ser IGNORADO e diz por que; "" significa
 // "pode aplicar". E deliberadamente PURA — sem rede, disco nem estado global — para

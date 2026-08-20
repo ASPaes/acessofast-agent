@@ -36,12 +36,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
-
-	"golang.org/x/sys/windows"
 )
 
 const (
@@ -96,42 +93,9 @@ func failWith(code int, format string, a ...any) *enrollExitError {
 	return &enrollExitError{code: code, msg: fmt.Sprintf(format, a...)}
 }
 
-// ---------------------------------------------------------------------------
-// Localizacao do cliente branded (AcessoFast.exe)
-//
-// O binario e RustDesk por baixo, mas o build branded renomeia o app-name para
-// AcessoFast: o exe vira AcessoFast.exe e instala em C:\Program Files\AcessoFast
-// (confirmado em maquina real, e no InstallLocation do registro de Uninstall).
-// Procurar "RustDesk\rustdesk.exe" — como era antes — falha em toda maquina com
-// o cliente branded, e a matricula morre aqui com exit 4.
-// ---------------------------------------------------------------------------
-
-func findRustDeskExe() (string, error) {
-	candidates := []string{}
-
-	for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"} {
-		if base := os.Getenv(env); base != "" {
-			candidates = append(candidates, filepath.Join(base, "AcessoFast", "AcessoFast.exe"))
-		}
-	}
-	// Fallback literal, caso as env vars estejam vazias (contexto de servico atipico).
-	candidates = append(candidates,
-		`C:\Program Files\AcessoFast\AcessoFast.exe`,
-		`C:\Program Files (x86)\AcessoFast\AcessoFast.exe`,
-	)
-
-	seen := map[string]bool{}
-	for _, p := range candidates {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
-			return p, nil
-		}
-	}
-	return "", errors.New("AcessoFast.exe nao encontrado nos caminhos padrao")
-}
+// Localizacao do cliente branded: findRustDeskExe() vive na camada de plataforma
+// (plat_windows.go / plat_darwin.go) — o caminho de instalacao nao tem nada em comum
+// entre um Program Files e um bundle .app.
 
 // ---------------------------------------------------------------------------
 // Leitura do RustDesk ID (com retry — o ID nasce no 1o run do servico)
@@ -161,13 +125,8 @@ func getRustDeskID(exe string) (string, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Identificacao do SO
+// Identificacao do SO  (osString() e por plataforma)
 // ---------------------------------------------------------------------------
-
-func osString() string {
-	v := windows.RtlGetVersion()
-	return fmt.Sprintf("Windows %d.%d.%d", v.MajorVersion, v.MinorVersion, v.BuildNumber)
-}
 
 func machineAlias() string {
 	if h, err := os.Hostname(); err == nil && h != "" {
@@ -234,31 +193,10 @@ func postEnroll(secret, rid, osStr, alias string) (*enrollResp, error) {
 // Gravacao segura das credenciais
 // ---------------------------------------------------------------------------
 
-// hardenDir tranca o diretorio para SYSTEM + Administradores apenas.
-//
-// CRITICO: C:\ProgramData por padrao concede LEITURA a "Users". O agent.token e uma
-// CREDENCIAL — quem le o token forja eventos de sessao daquela maquina (corrompe billing).
-// Sem isso, qualquer usuario logado na maquina do cliente le o token.
-//
-// Usamos SIDs bem-conhecidos, NAO nomes: em Windows pt-BR "Administrators" se chama
-// "Administradores" e "SYSTEM" se chama "SISTEMA" — nome literal quebraria em todo o
-// nosso mercado.
-func hardenDir(dir string) error {
-	const (
-		sidSystem         = "*S-1-5-18"     // NT AUTHORITY\SYSTEM
-		sidAdministrators = "*S-1-5-32-544" // BUILTIN\Administrators
-	)
-
-	cmd := exec.Command("icacls", dir,
-		"/inheritance:r",
-		"/grant:r", sidSystem+":(OI)(CI)F",
-		"/grant:r", sidAdministrators+":(OI)(CI)F",
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("icacls falhou: %v — %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
+// hardenDir (por plataforma) tranca o diretorio de credenciais para o administrador
+// do sistema. O agent.token e uma CREDENCIAL: quem o le forja eventos de sessao
+// daquela maquina e corrompe o faturamento. Nos dois SOs o diretorio publico e
+// legivel por usuario comum por padrao, entao trancar nao e opcional.
 
 func writeCredentials(token, rid string) error {
 	if err := os.MkdirAll(baseDir, 0o700); err != nil {

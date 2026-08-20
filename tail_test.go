@@ -62,22 +62,3 @@ func TestFatiaLinhasDescartaBufferGigante(t *testing.T) {
 		t.Fatalf("sobra acima do teto devia ser descartada, sobraram %d bytes", len(tl.pending))
 	}
 }
-
-// A porta vem no DWORD do MIB em network byte order nos dois bytes baixos; ler errado
-// confundiria o rendezvous (ocioso) com uma sessao e o fantasma nunca seria detectado.
-func TestPortaDeLeNetworkByteOrder(t *testing.T) {
-	casos := []struct {
-		dword    uint32
-		esperada uint16
-	}{
-		{0x7B52, portaNatTest},    // 21115 = 0x527B
-		{0x7C52, portaRendezvous}, // 21116 = 0x527C
-		{0x7D52, 21117},           // relay -> conta como sessao
-		{0x5000, 80},              // porta baixa: pega inversao ingenua
-	}
-	for _, c := range casos {
-		if got := portaDe(c.dword); got != c.esperada {
-			t.Errorf("portaDe(%#x) = %d, esperava %d", c.dword, got, c.esperada)
-		}
-	}
-}

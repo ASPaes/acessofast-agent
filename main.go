@@ -1,6 +1,7 @@
 // AcessoFast — Agente de Sessao + Matriculador (binario unico).
 //
-// Sem argumentos          -> roda como servico Windows (ou console em debug).
+// Sem argumentos          -> roda como servico do SO (Windows: SCM; macOS: launchd),
+//                            ou em console quando iniciado a mao.
 // Com --enroll            -> executa a matricula do endpoint UMA vez e sai.
 //
 // Deteccao de sessao: o agente faz tail do log do cliente branded (namespace
@@ -16,7 +17,8 @@
 // fim (o encoder e destruido sem relogar a contagem). O par #N opened/closed
 // (src/server/connection.rs) e o unico sinal confiavel de inicio/fim.
 //
-// Loga em C:\ProgramData\AcessoFast\agent.log.
+// Loga em <baseDir>/agent.log — o baseDir e definido por plataforma
+// (plat_windows.go / plat_darwin.go).
 //
 // O caminho --enroll vive em enroll.go: le o RustDesk ID, chama enroll-device,
 // grava agent.token + rustdesk_id com ACL restrita.
@@ -35,9 +37,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/svc"
 )
 
 // ---------------------------------------------------------------------------
@@ -46,10 +45,6 @@ import (
 
 const (
 	serviceName       = "AcessoFastAgent"
-	baseDir           = `C:\ProgramData\AcessoFast`
-	tokenFile         = baseDir + `\agent.token`
-	ridFile           = baseDir + `\rustdesk_id`
-	logFile           = baseDir + `\agent.log`
 	ingestURL         = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/session-ingest"
 	pollInterval      = 3 * time.Second
 	heartbeatInterval = 20 * time.Second
@@ -60,6 +55,16 @@ const (
 	// reconexao (blip/queda curta, validado no teste #3). Reconexao dentro do prazo =
 	// mesma sessao (sem end, sem rotacao, sem churn de quota). Prazo vazio = fim real.
 	graceWindow = 60 * time.Second
+)
+
+// Caminhos derivados do baseDir, que e definido POR PLATAFORMA (plat_windows.go /
+// plat_darwin.go). Sao var e nao const porque filepath.Join resolve o separador em
+// tempo de execucao — no Windows o resultado e exatamente o de sempre
+// (C:\ProgramData\AcessoFast\agent.token e irmaos), byte por byte.
+var (
+	tokenFile = filepath.Join(baseDir, "agent.token")
+	ridFile   = filepath.Join(baseDir, "rustdesk_id")
+	logFile   = filepath.Join(baseDir, "agent.log")
 )
 
 // anonKey e publica por design (role=anon). Preferencia: injetar no CI via
@@ -126,12 +131,7 @@ func discoverRustdeskID() string {
 	if v := readTrim(ridFile); v != "" {
 		return v
 	}
-	globs := []string{
-		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\config\AcessoFast.toml`,
-		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\config\AcessoFast2.toml`,
-		`C:\Users\*\AppData\Roaming\AcessoFast\config\AcessoFast.toml`,
-		`C:\Users\*\AppData\Roaming\AcessoFast\config\AcessoFast2.toml`,
-	}
+	globs := clientConfigGlobs()
 	idRe := regexp.MustCompile(`(?m)^\s*id\s*=\s*['"]?([0-9]{6,})`)
 	for _, g := range globs {
 		matches, _ := filepath.Glob(g)
@@ -160,11 +160,7 @@ func discoverRustdeskID() string {
 // retorna "" e o poll re-tenta a cada 3s (o log server\ nasce na 1a sessao
 // recebida — ate la nao ha nada pra detectar naquela maquina).
 func findRustdeskLog() string {
-	serverLogs := []string{
-		`C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\AcessoFast\log\server\AcessoFast_rCURRENT.log`,
-		`C:\Windows\System32\config\systemprofile\AppData\Roaming\AcessoFast\log\server\AcessoFast_rCURRENT.log`,
-		`C:\Users\*\AppData\Roaming\AcessoFast\log\server\AcessoFast_rCURRENT.log`,
-	}
+	serverLogs := clientServerLogGlobs()
 	var best string
 	var bestT time.Time
 	for _, p := range serverLogs {
@@ -319,27 +315,6 @@ type tailer struct {
 	// Segunda fonte fora do log, como clientStart: se o "closed" se perdeu de vez, o
 	// socket e quem prova que a sessao acabou. Ver checkSessaoViva() em sessao_socket.go.
 	semSocketDesde time.Time
-}
-
-// clientProcStartTime devolve o horario de inicio do processo do servico do cliente
-// branded (AcessoFast). Fonte FORA do log — o log nao distingue restart (conexoes
-// cairam) de rotacao benigna (conexoes seguem). (time.Time{}, false) se indisponivel
-// (servico parado, sem permissao): nesse caso o detector nao age.
-func clientProcStartTime() (time.Time, bool) {
-	pid, ok := clientProcPID()
-	if !ok {
-		return time.Time{}, false
-	}
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-	if err != nil {
-		return time.Time{}, false
-	}
-	defer windows.CloseHandle(h)
-	var cre, exi, ker, usr windows.Filetime
-	if err := windows.GetProcessTimes(h, &cre, &exi, &ker, &usr); err != nil {
-		return time.Time{}, false
-	}
-	return time.Unix(0, cre.Nanoseconds()), true
 }
 
 func (t *tailer) processLine(line string) {
@@ -514,7 +489,7 @@ func (t *tailer) fatiaLinhas(chunk string) []string {
 // AcessoFast_r*.log mais recente do mesmo diretorio que nao seja o proprio _rCURRENT;
 // "" quando nao ha nada a recuperar.
 func tailRotacionado(cur string, from int64) string {
-	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(cur), "AcessoFast_r*.log"))
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(cur), clientLogPattern))
 	var best string
 	var bestT time.Time
 	for _, m := range matches {
@@ -748,28 +723,6 @@ func worker(stop <-chan struct{}) {
 	}
 }
 
-// ---- servico Windows ----
-type service struct{}
-
-func (s *service) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	changes <- svc.Status{State: svc.StartPending}
-	stop := make(chan struct{})
-	go worker(stop)
-	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
-	for c := range r {
-		switch c.Cmd {
-		case svc.Interrogate:
-			changes <- c.CurrentStatus
-		case svc.Stop, svc.Shutdown:
-			close(stop)
-			changes <- svc.Status{State: svc.StopPending}
-			return false, 0
-		default:
-		}
-	}
-	return false, 0
-}
-
 func openLog() {
 	os.MkdirAll(baseDir, 0755)
 	if f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
@@ -793,16 +746,7 @@ func main() {
 	}
 
 	openLog()
-	isSvc, err := svc.IsWindowsService()
-	if err != nil {
-		logln("IsWindowsService erro: %v", err)
-	}
-	if !isSvc {
-		logln("(modo console/debug — Ctrl+C pra sair)")
-		worker(make(chan struct{}))
-		return
-	}
-	if err := svc.Run(serviceName, &service{}); err != nil {
-		logln("svc.Run erro: %v", err)
-	}
+	// runAgent vive na camada de plataforma: no Windows decide entre servico SCM e
+	// console; no macOS roda em foreground sob o launchd, tratando SIGTERM.
+	runAgent()
 }

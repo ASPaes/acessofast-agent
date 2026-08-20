@@ -27,17 +27,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/mgr"
 )
 
 const (
-	rotateURL   = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/rotate-device-secret"
-	pendingFile = baseDir + `\rotate.pending` // senha JA aplicada no endpoint aguardando confirmacao do painel
+	rotateURL = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/rotate-device-secret"
 
 	// Cadencia do reenvio da pendencia, escalonada pelo tempo que ela esta aberta.
 	// O caso comum e a INSTALACAO NOVA: o rotate-on-boot aplica a senha antes de a
@@ -53,11 +50,19 @@ const (
 	rotateRetryFastFor = 2 * time.Minute
 	rotateRetrySlowFor = 10 * time.Minute
 
-	// holdFile (§4.3): "hold de manutencao". Timestamp RFC3339; enquanto now<hold_until,
-	// o rotate-on-boot (§3.2) e suprimido (reboot planejado — a sessao pode voltar
-	// sozinha). Ausente/ilegivel/expirado = sem hold. O caminho painel->agente que
-	// ESCREVE este arquivo e trabalho do §4.3; aqui o agente apenas LE.
-	holdFile = baseDir + `\hold.until`
+)
+
+// Caminhos derivados do baseDir, que e por plataforma (plat_windows.go / plat_darwin.go).
+//
+// pendingFile: senha JA aplicada no endpoint, aguardando confirmacao do painel.
+//
+// holdFile (§4.3): "hold de manutencao". Timestamp RFC3339; enquanto now<hold_until,
+// o rotate-on-boot (§3.2) e suprimido (reboot planejado — a sessao pode voltar
+// sozinha). Ausente/ilegivel/expirado = sem hold. O caminho painel->agente que
+// ESCREVE este arquivo e trabalho do §4.3; aqui o agente apenas LE.
+var (
+	pendingFile = filepath.Join(baseDir, "rotate.pending")
+	holdFile    = filepath.Join(baseDir, "hold.until")
 )
 
 // Politica de senha — ESPELHA provision-device-secret (alfabeto sem ambiguos 0 O 1 l I).
@@ -229,50 +234,9 @@ func rotateOnBoot() {
 	rotateNow()
 }
 
-// clientServiceName: o servico Windows do cliente branded (o RustDesk server que
-// RECEBE as conexoes). Distinto do agente (serviceName = "AcessoFastAgent" em main.go).
-const clientServiceName = "AcessoFast"
-
-// restartClientService reinicia o servico do cliente branded. Billing B2: e o corte
-// DURO do free — parar o servico derruba a sessao ativa; ao subir, o cliente recarrega
-// a config com a senha JA rotacionada. Roda como SYSTEM (o agente e servico), entao tem
-// privilegio pra controlar o SCM. Bounded: espera ate ~20s pelo estado Stopped.
-func restartClientService() {
-	m, err := mgr.Connect()
-	if err != nil {
-		logln("CUT: mgr.Connect falhou: %v", err)
-		return
-	}
-	defer m.Disconnect()
-
-	s, err := m.OpenService(clientServiceName)
-	if err != nil {
-		logln("CUT: OpenService(%s) falhou: %v", clientServiceName, err)
-		return
-	}
-	defer s.Close()
-
-	status, err := s.Control(svc.Stop)
-	if err != nil {
-		// Ja parado, ou sem controle: loga e ainda tenta subir (idempotente).
-		logln("CUT: Stop(%s) falhou: %v (tentando start assim mesmo)", clientServiceName, err)
-	} else {
-		deadline := time.Now().Add(20 * time.Second)
-		for status.State != svc.Stopped && time.Now().Before(deadline) {
-			time.Sleep(500 * time.Millisecond)
-			if status, err = s.Query(); err != nil {
-				logln("CUT: Query(%s) falhou: %v", clientServiceName, err)
-				break
-			}
-		}
-	}
-
-	if err := s.Start(); err != nil {
-		logln("CUT: Start(%s) falhou: %v", clientServiceName, err)
-		return
-	}
-	logln("CUT: servico %s reiniciado — sessao derrubada, senha nova ativa", clientServiceName)
-}
+// restartClientService (por plataforma) reinicia o servico do cliente branded.
+// Billing B2: e o corte DURO do free — parar o servico derruba a sessao ativa; ao
+// subir, o cliente recarrega a config com a senha JA rotacionada.
 
 // flushPending reenvia ao painel a senha pendente (JA aplicada no endpoint).
 // true = nao ha mais pendencia: ou nao havia nada a enviar, ou o painel confirmou.
