@@ -32,8 +32,22 @@ $svcName = 'AcessoFastAgent'
 $baseDir = 'C:\ProgramData\AcessoFast'
 $url     = "https://github.com/ASPaes/acessofast-agent/releases/download/$Version/acessofast-agent.exe"
 
+# NAO usar $env:TEMP: em maquina cujo usuario do Windows tem acento no nome, ele vem
+# como nome curto 8.3 (C:\Users\USUARIO~2\...) e o provider de caminho do PowerShell
+# se perde nele — o Remove-Item resolveu so ate "C:\Users\USUARIO~2" e estourou.
+# C:\Windows\Temp e ASCII, existe em toda maquina e e gravavel por SYSTEM/admin.
+$tmpDir = 'C:\Windows\Temp'
+
 function Falhar($msg) { Write-Host "FALHOU: $msg" -ForegroundColor Red; exit 1 }
 function Ok($msg)     { Write-Host "OK: $msg"     -ForegroundColor Green }
+
+# Apagar o temporario e cosmetico e NUNCA pode derrubar o script: com
+# $ErrorActionPreference='Stop' um erro aqui matava a execucao antes do resumo, e o
+# tecnico ficava sem o rustdesk_id e sem saber se a maquina precisa ser adotada —
+# que e a unica parte acionavel da saida. Aconteceu em campo (25/08).
+function Limpar($caminho) {
+  try { Remove-Item -LiteralPath $caminho -Force -ErrorAction SilentlyContinue } catch { }
+}
 
 # O PathName do servico pode vir com aspas e com argumentos. Um .Trim('"') simples
 # devolveria o caminho junto com os argumentos e o Copy-Item erraria o alvo.
@@ -55,11 +69,13 @@ if (-not $svc) {
 }
 
 $exe = CaminhoDoExe $svc.PathName
-if (-not (Test-Path $exe)) { Falhar "binario do servico nao encontrado em: $exe" }
+if (-not (Test-Path -LiteralPath $exe)) { Falhar "binario do servico nao encontrado em: $exe" }
 Write-Host "Binario: $exe"
 
 # --- 2) Ja estamos no alvo? -------------------------------------------------
-$hashAtual = (Get-FileHash $exe -Algorithm SHA256).Hash
+# -LiteralPath em TODO cmdlet de caminho: sem ele o PowerShell interpreta o caminho
+# como padrao com curinga, e basta um colchete no perfil do usuario pra quebrar.
+$hashAtual = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
 if ($hashAtual -eq $Sha256.ToUpper()) {
   if ((Get-Service $svcName).Status -ne 'Running') { Start-Service $svcName }
   Ok "ja esta em $Version; nada a fazer."
@@ -70,7 +86,7 @@ if ($hashAtual -eq $Sha256.ToUpper()) {
 # TLS 1.2 explicito: PowerShell 5.1 em Windows nao atualizado ainda negocia TLS 1.0
 # por padrao e o GitHub recusa.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$novo = Join-Path $env:TEMP "acessofast-agent-$Version.exe"
+$novo = Join-Path $tmpDir "acessofast-agent-$Version.exe"
 Write-Host "Baixando $Version ..."
 try {
   Invoke-WebRequest -UseBasicParsing $url -OutFile $novo
@@ -78,9 +94,9 @@ try {
   Falhar "download: $($_.Exception.Message)"
 }
 
-$hashNovo = (Get-FileHash $novo -Algorithm SHA256).Hash
+$hashNovo = (Get-FileHash -LiteralPath $novo -Algorithm SHA256).Hash
 if ($hashNovo -ne $Sha256.ToUpper()) {
-  Remove-Item $novo -Force -ErrorAction SilentlyContinue
+  Limpar $novo
   Falhar "SHA256 nao confere (esperado $Sha256, veio $hashNovo). Servico intacto."
 }
 Ok "hash conferido."
@@ -88,19 +104,21 @@ Ok "hash conferido."
 # --- 4) Trocar (a partir daqui o servico volta a subir em qualquer saida) ----
 $backup = "$exe.bak-preupdate"
 try {
-  Copy-Item $exe $backup -Force
+  Copy-Item -LiteralPath $exe -Destination $backup -Force
   Stop-Service $svcName -Force
   # O Windows pode segurar o arquivo por um instante depois do stop.
   $trocou = $false
   foreach ($tentativa in 1..10) {
-    try { Copy-Item $novo $exe -Force; $trocou = $true; break }
+    try { Copy-Item -LiteralPath $novo -Destination $exe -Force; $trocou = $true; break }
     catch { Start-Sleep -Milliseconds 500 }
   }
   if (-not $trocou) { throw "nao consegui substituir o binario (arquivo em uso)." }
 }
 catch {
   $erro = $_.Exception.Message
-  if (Test-Path $backup) { Copy-Item $backup $exe -Force -ErrorAction SilentlyContinue }
+  if (Test-Path -LiteralPath $backup) {
+    Copy-Item -LiteralPath $backup -Destination $exe -Force -ErrorAction SilentlyContinue
+  }
   Start-Service $svcName -ErrorAction SilentlyContinue
   Falhar "$erro (binario anterior restaurado, servico religado)."
 }
@@ -108,16 +126,19 @@ catch {
 Start-Service $svcName
 Start-Sleep -Seconds 3
 if ((Get-Service $svcName).Status -ne 'Running') {
-  Copy-Item $backup $exe -Force
+  Copy-Item -LiteralPath $backup -Destination $exe -Force
   Start-Service $svcName
   Falhar "o servico nao subiu com a versao nova; binario anterior restaurado."
 }
-Remove-Item $novo -Force -ErrorAction SilentlyContinue
 
 # --- 5) O que o tecnico precisa levar para o painel -------------------------
+# ANTES da limpeza, de proposito: a troca ja deu certo e o resumo e o que o tecnico
+# leva pro painel. Nada meramente cosmetico pode vir na frente dele.
 $rid = ''
-if (Test-Path "$baseDir\rustdesk_id") { $rid = (Get-Content "$baseDir\rustdesk_id" -Raw).Trim() }
-$adotada = Test-Path "$baseDir\agent.token"
+if (Test-Path -LiteralPath "$baseDir\rustdesk_id") {
+  $rid = (Get-Content -LiteralPath "$baseDir\rustdesk_id" -Raw).Trim()
+}
+$adotada = Test-Path -LiteralPath "$baseDir\agent.token"
 
 Ok "$Version instalada e rodando."
 Write-Host ""
@@ -125,3 +146,5 @@ Write-Host "  rustdesk_id : $(if ($rid) { $rid } else { '(nao encontrado)' })"
 Write-Host "  adotada     : $(if ($adotada) { 'sim' } else { 'NAO — aprovar no painel' })"
 Write-Host ""
 Write-Host "A versao aparece no painel no proximo 'presence' (ate 60s)."
+
+Limpar $novo
