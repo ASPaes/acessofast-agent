@@ -7,8 +7,19 @@
 # para 105 das 123 maquinas online. Esta e a unica rodada manual necessaria —
 # depois dela a maquina se atualiza sozinha, para sempre.
 #
-# USO (UMA linha; nunca colar multilinha em console de sessao remota):
-#   powershell -ExecutionPolicy Bypass -File C:\Windows\Temp\bootstrap.ps1
+# USO — UMA linha, colada em Prompt de Comando OU PowerShell, COMO ADMINISTRADOR.
+# Nunca colar bloco multilinha: em console de sessao remota as linhas chegam como
+# eventos separados e sem garantia de ordem (ja rodaram invertidas em campo, 25/08).
+#
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "if(-not([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(544)){Write-Host 'ABRA COMO ADMINISTRADOR.' -ForegroundColor Red;exit 1};[Net.ServicePointManager]::SecurityProtocol=3072;iwr -UseBasicParsing https://raw.githubusercontent.com/ASPaes/acessofast-agent/main/bootstrap.ps1 -OutFile C:\Windows\Temp\bs.ps1;& C:\Windows\Temp\bs.ps1"
+#
+# Por que a linha e assim e nao um `iwr` solto:
+#   - o tecnico costuma abrir o Prompt de Comando, nao o PowerShell, e la `iwr` nao
+#     existe. Prefixar com `powershell -Command` faz a mesma linha servir nos dois.
+#   - o `iwr` que baixa ESTE arquivo tambem precisa de TLS 1.2 (Windows 8.1 negocia
+#     1.0 por padrao). Nao adianta o script setar; sem isso ele nem chega a ser baixado.
+#   - sem elevacao o erro seria um "acesso negado" ao gravar em C:\Windows\Temp, antes
+#     de qualquer checagem daqui. A verificacao no lancador troca isso por um recado.
 #
 # SEGURO PARA REPETIR: se a maquina ja estiver na versao alvo, nao faz nada.
 #
@@ -58,6 +69,14 @@ function CaminhoDoExe($pathName) {
 }
 
 # --- 1) Pre-condicoes -------------------------------------------------------
+# Piso da frota e o Windows 8.1 (6.3.9600, 7 maquinas em 25/08) — PowerShell 4.0,
+# que ja traz Get-FileHash, Get-CimInstance e Invoke-WebRequest. Nao ha Windows 7 na
+# frota; se aparecer um, ele vem com PS 2.0 e morreria no Get-FileHash com um erro
+# obscuro. Melhor dizer o motivo.
+if ($PSVersionTable.PSVersion.Major -lt 4) {
+  Falhar "precisa de PowerShell 4.0+ (Get-FileHash); esta maquina tem $($PSVersionTable.PSVersion)."
+}
+
 $eAdmin = ([Security.Principal.WindowsPrincipal] `
   [Security.Principal.WindowsIdentity]::GetCurrent()
   ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -83,9 +102,15 @@ if ($hashAtual -eq $Sha256.ToUpper()) {
 }
 
 # --- 3) Baixar e CONFERIR antes de parar o servico --------------------------
-# TLS 1.2 explicito: PowerShell 5.1 em Windows nao atualizado ainda negocia TLS 1.0
-# por padrao e o GitHub recusa.
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# TLS 1.2 explicito: no Windows 8.1 (PowerShell 4.0 / .NET 4.5) o padrao ainda e
+# Ssl3+Tls1.0 e o GitHub recusa a conexao. 3072 e o valor de Tls12 escrito como
+# numero de proposito — em .NET antigo o NOME Tls12 nao existe no enum e a linha
+# estouraria antes de chegar ao download. O -bor preserva o que ja estava ligado.
+try {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+} catch {
+  Falhar "esta maquina nao consegue habilitar TLS 1.2; o GitHub nao aceita conexao sem ele."
+}
 $novo = Join-Path $tmpDir "acessofast-agent-$Version.exe"
 Write-Host "Baixando $Version ..."
 try {
