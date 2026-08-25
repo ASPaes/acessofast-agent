@@ -84,7 +84,42 @@ if (-not $eAdmin) { Falhar "abra o PowerShell como Administrador." }
 
 $svc = Get-CimInstance Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
 if (-not $svc) {
-  Falhar "o servico $svcName nao existe nesta maquina. Bootstrap e so para quem ja tem o agente; maquina nova precisa do instalador."
+  # "Servico nao existe" sozinho manda o tecnico para o lugar errado: em campo
+  # (25/08) apareceu uma maquina SEM o servico mas COM a pasta do agente em
+  # Program Files. Instalacao antiga, servico apagado, ou agente rodando por outro
+  # meio sao diagnosticos diferentes e consertos diferentes. Entao a saida conta o
+  # que existe na maquina em vez de so dizer o que falta.
+  Write-Host "O servico $svcName nao existe nesta maquina. O que encontrei:" -ForegroundColor Yellow
+
+  $parecidos = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+                 Where-Object Name -match 'acesso|fast|rustdesk')
+  if ($parecidos.Count) {
+    Write-Host "  servicos parecidos:"
+    $parecidos | ForEach-Object { Write-Host "    $($_.Name) [$($_.State)] $($_.PathName)" }
+  } else { Write-Host "  servicos parecidos: nenhum" }
+
+  $tarefas = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+               Where-Object TaskName -match 'acesso|fast')
+  if ($tarefas.Count) {
+    Write-Host "  tarefas agendadas:"
+    $tarefas | ForEach-Object { Write-Host "    $($_.TaskPath)$($_.TaskName) [$($_.State)]" }
+  } else { Write-Host "  tarefas agendadas: nenhuma" }
+
+  $pasta = 'C:\Program Files\AcessoFast Agent'
+  if (Test-Path -LiteralPath $pasta) {
+    Write-Host "  $pasta :"
+    Get-ChildItem -LiteralPath $pasta -ErrorAction SilentlyContinue |
+      ForEach-Object { Write-Host "    $($_.Name)  $($_.LastWriteTime)" }
+  } else { Write-Host "  $pasta : nao existe" }
+
+  if (Test-Path -LiteralPath "$baseDir\agent.token") {
+    Write-Host "  $baseDir\agent.token : existe (a maquina ja foi adotada alguma vez)"
+  } else {
+    Write-Host "  $baseDir\agent.token : nao existe"
+  }
+
+  Write-Host ""
+  Falhar "sem o servico nao ha o que trocar. Manda esta saida antes de reinstalar — o conserto depende do que apareceu acima."
 }
 
 $exe = CaminhoDoExe $svc.PathName
