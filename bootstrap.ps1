@@ -118,8 +118,32 @@ if (-not $svc) {
     Write-Host "  $baseDir\agent.token : nao existe"
   }
 
+  # Veredito: os dois casos se distinguem por UMA coisa — a credencial. Ela decide
+  # se o conserto preserva a identidade da maquina no painel ou cria outra.
   Write-Host ""
-  Falhar "sem o servico nao ha o que trocar. Manda esta saida antes de reinstalar — o conserto depende do que apareceu acima."
+  $temCredencial = Test-Path -LiteralPath "$baseDir\agent.token"
+  $temPasta      = Test-Path -LiteralPath $pasta
+  if ($temCredencial) {
+    # Agente ja rodou e foi adotado; so o servico sumiu (desinstalacao parcial).
+    # Reinstalar por cima aqui e o caminho ERRADO: arrisca rematricular uma maquina
+    # que o painel ja conhece. Recriar o servico preserva tudo.
+    Write-Host "DIAGNOSTICO: a credencial existe, so o servico sumiu." -ForegroundColor Yellow
+    Write-Host "  Recriar o servico preserva a adocao. NAO reinstalar por cima."
+  }
+  elseif ($temPasta) {
+    # Arquivos presentes e ProgramData vazio = o agente nunca rodou. Visto em campo
+    # (25/08): instalador passou, escreveu o desinstalador e parou antes do servico.
+    Write-Host "DIAGNOSTICO: instalacao incompleta — os arquivos estao aqui mas o agente nunca rodou." -ForegroundColor Yellow
+    Write-Host "  ProgramData vazio = sem token e sem matricula. Esta maquina nao esta na frota."
+    Write-Host "  Conserto: rodar o unins000.exe desta pasta e depois o AcessoFastSetup.exe atual."
+  }
+  else {
+    Write-Host "DIAGNOSTICO: nao ha AcessoFast nesta maquina." -ForegroundColor Yellow
+    Write-Host "  Conserto: instalacao normal com o AcessoFastSetup.exe."
+  }
+
+  Write-Host ""
+  Falhar "sem o servico nao ha o que trocar (veja o diagnostico acima)."
 }
 
 $exe = CaminhoDoExe $svc.PathName
