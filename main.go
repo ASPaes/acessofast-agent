@@ -60,6 +60,20 @@ const (
 	// reconexao (blip/queda curta, validado no teste #3). Reconexao dentro do prazo =
 	// mesma sessao (sem end, sem rotacao, sem churn de quota). Prazo vazio = fim real.
 	graceWindow = 60 * time.Second
+
+	// duracaoMinAutenticada — limiar de "esta conexao chegou a virar sessao".
+	//
+	// O cliente loga "#N Connection opened" no ACCEPT do TCP, ANTES de validar a senha:
+	// uma tentativa RECUSADA produz opened + closed identicos aos de uma sessao real.
+	// Rotacionar em cima disso era um laco que se alimentava sozinho — a senha que o
+	// painel acabara de entregar morria por causa da propria tentativa que falhou, e a
+	// seguinte tambem (caso 007BOMBONIERE03, 25/08/2026: sessoes de 69-81s em serie,
+	// = ~10s de conexao recusada + graceWindow).
+	//
+	// Sinal primario e o peer_id (so sai depois do login aceito); o limiar de tempo e a
+	// rede de protecao para o cliente que nao emite peer_id — uma senha recusada fecha
+	// em segundos, uma sessao de verdade passa disto.
+	duracaoMinAutenticada = 15 * time.Second
 )
 
 // anonKey e publica por design (role=anon). Preferencia: injetar no CI via
@@ -319,6 +333,54 @@ type tailer struct {
 	// Segunda fonte fora do log, como clientStart: se o "closed" se perdeu de vez, o
 	// socket e quem prova que a sessao acabou. Ver checkSessaoViva() em sessao_socket.go.
 	semSocketDesde time.Time
+
+	// clienteParadoDesde / ultimaSubidaCliente: estado da autocura do servico do
+	// cliente (vigia_cliente.go). Zero = servico no ar / nunca tentamos subir.
+	clienteParadoDesde  time.Time
+	ultimaSubidaCliente time.Time
+
+	// autenticada: alguma conexao DESTA sessao passou do login. Falso enquanto so
+	// houve accept de TCP — que e o que uma senha recusada produz. So a sessao
+	// autenticada gira a senha efemera no fim (ver rotacionarSeAutenticada). Vale pela
+	// sessao inteira, inclusive atravessando a carencia: e limpo so no fim REAL.
+	autenticada bool
+}
+
+// marcaAutenticada registra que a sessao passou do login, uma vez so por sessao.
+func (t *tailer) marcaAutenticada(motivo string) {
+	if t.autenticada {
+		return
+	}
+	t.autenticada = true
+	logln(">>> sessao autenticada (%s) — a senha efemera sera girada no fim", motivo)
+}
+
+// autenticaPorTempo marca a sessao pelas conexoes AINDA abertas que ja passaram do
+// limiar. Os fins que nao vem de um "closed" (fantasma, expiracao) nunca passam pelo
+// ramo do closedRe, entao e aqui que uma sessao longa e presa se declara legitima.
+func (t *tailer) autenticaPorTempo() {
+	for id, abertaEm := range t.open {
+		if time.Since(abertaEm) >= duracaoMinAutenticada {
+			t.marcaAutenticada(fmt.Sprintf("#%s aberta ha mais de %s", id, duracaoMinAutenticada))
+			return
+		}
+	}
+}
+
+// rotacionarSeAutenticada gira a senha efemera no fim de sessao — SO se a sessao
+// chegou a autenticar. Tentativa recusada nao gira: a senha nunca foi aceita, entao
+// nada vazou, e girar ali so invalidaria a senha que o painel acabou de entregar.
+// Fica igual ao caso "o tecnico pediu a senha e nao conectou", que ja nao girava.
+// Chamar sempre no fim REAL, que tambem e onde a marca da sessao e limpa.
+func (t *tailer) rotacionarSeAutenticada(motivo string) {
+	autenticada := t.autenticada
+	t.autenticada = false
+	if !autenticada {
+		logln("ROTATE suprimido (%s): nenhuma conexao autenticou — senha do painel mantida", motivo)
+		return
+	}
+	// Em goroutine: faz exec (--password) + HTTP e nao pode bloquear o poll de deteccao.
+	go rotateNow()
 }
 
 // clientProcStartTime devolve o horario de inicio do processo do servico do cliente
@@ -378,6 +440,12 @@ func (t *tailer) processLine(line string) {
 	// (idempotente p/ device ja adotado: a session-ingest so trata start c/ device ausente).
 	if m := peerIdRe.FindStringSubmatch(line); m != nil {
 		id, peer := m[1], m[2]
+		// O peer_id so sai depois do login aceito: e a prova direta de que esta
+		// conexao NAO e uma senha recusada. Marca antes do filtro do controllerID —
+		// a 2a conexao da mesma sessao tambem autentica, e o controlador ja e conhecido.
+		if _, open := t.open[id]; open {
+			t.marcaAutenticada(fmt.Sprintf("peer_id do #%s", id))
+		}
 		if _, open := t.open[id]; open && t.controllerID == "" {
 			t.controllerID = peer
 			logln(">>> peer_id do #%s = %s (controlador) — reenviando start com controlador", id, peer)
@@ -389,7 +457,12 @@ func (t *tailer) processLine(line string) {
 	}
 	if m := closedRe.FindStringSubmatch(line); m != nil {
 		id := m[1]
-		if _, exists := t.open[id]; exists {
+		if abertaEm, exists := t.open[id]; exists {
+			// Rede de protecao do cliente que nao emite peer_id: uma conexao que ficou
+			// aberta mais que o limiar nao foi senha recusada (essa fecha em segundos).
+			if time.Since(abertaEm) >= duracaoMinAutenticada {
+				t.marcaAutenticada(fmt.Sprintf("#%s durou mais de %s", id, duracaoMinAutenticada))
+			}
 			delete(t.open, id)
 			logln("<<< conexao #%s fechada (abertas agora: %d)", id, len(t.open))
 			if len(t.open) == 0 {
@@ -416,9 +489,9 @@ func (t *tailer) checkGrace() {
 		t.controllerID = ""          // fim real -> esquece o controlador desta sessao
 		logln("<<< carencia expirou sem reconexao — SESSAO ENCERRADA")
 		postEvent("end", "")
-		// Fase 2: gira a senha efemera so agora, no fim REAL da sessao. Em goroutine —
-		// faz exec (--password) + HTTP e nao pode bloquear o poll de deteccao.
-		go rotateNow()
+		// Fase 2: gira a senha efemera so agora, no fim REAL da sessao — e so se a
+		// sessao chegou a autenticar (tentativa recusada nao gira).
+		t.rotacionarSeAutenticada("carencia expirou")
 	}
 }
 
@@ -435,6 +508,14 @@ func (t *tailer) checkHardCap() {
 		t.hardCapUntil = time.Time{} // desarma ANTES de agir -> nao corta de novo no proximo tick
 		logln("<<< CORTE (limite): rotacionando senha e derrubando a sessao (abertas: %d)", len(t.open))
 
+		// Le a marca ANTES de esvaziar t.open: o corte nao passa por "closed", entao e
+		// aqui que uma sessao longa sem peer_id se declara legitima. O corte de 2h so
+		// vence sobre sessao real, entao na pratica isto sempre marca; o guard existe
+		// pros gatilhos de saldo/simultaneas, que o servidor manda com cap = agora.
+		t.autenticaPorTempo()
+		autenticada := t.autenticada
+		t.autenticada = false
+
 		// A sessao acaba AGORA por corte administrativo. O force-stop do servico do
 		// cliente NAO emite "#N Connection closed" no log -> os #N ficam presos em
 		// t.open, o heartbeat continua e o connection_logs vira FANTASMA (ativo ate
@@ -449,7 +530,11 @@ func (t *tailer) checkHardCap() {
 		postEvent("end", "")
 
 		go func() {
-			rotateNow()            // 1) nova senha no endpoint (a vista morre)
+			if autenticada {
+				rotateNow() // 1) nova senha no endpoint (a vista morre)
+			} else {
+				logln("ROTATE suprimido (corte): nenhuma conexao autenticou — senha do painel mantida")
+			}
 			restartClientService() // 2) reinicia o cliente -> a conexao ativa cai
 		}()
 	}
@@ -470,6 +555,7 @@ func (t *tailer) expireStale() {
 			if len(t.open) == 0 {
 				t.hardCapUntil = time.Time{} // fim forcado -> desarma o cap 2h
 				t.controllerID = ""
+				t.autenticada = false // fim forcado -> nao vaza a marca pra proxima sessao
 				postEvent("end", "")
 			}
 		}
@@ -570,10 +656,15 @@ func (t *tailer) poll() {
 				t.graceUntil = time.Time{}
 				t.hardCapUntil = time.Time{}
 				t.controllerID = ""
+				t.autenticada = false // fim real -> nao vaza a marca pra sessao seguinte
 				postEvent("end", "")
 			}
 			t.primed = false // re-prima do log novo
 			t.offset = 0
+			// O cliente subiu de novo lendo a config do disco: a senha que ele passa a
+			// exigir pode nao ser a que o painel conhece. Re-sincroniza (o rotateNow so
+			// aplica com o cliente de pe, e aqui ele acabou de subir).
+			go rotateAposRestartDoCliente()
 		}
 		t.clientStart = st
 	}
@@ -721,9 +812,10 @@ func worker(stop <-chan struct{}) {
 			return
 		case <-pollT.C:
 			t.poll()
-			t.checkSessaoViva() // fantasma: #N preso sem socket de sessao -> encerra
-			t.checkGrace()      // §3.1: fecha a sessao adiada quando a carencia expira
-			t.checkHardCap()    // B2: corta o free ao vencer o cap de 2h
+			t.checkClienteParado() // autocura: sobe o servico do cliente se ele caiu
+			t.checkSessaoViva()    // fantasma: #N preso sem socket de sessao -> encerra
+			t.checkGrace()         // §3.1: fecha a sessao adiada quando a carencia expira
+			t.checkHardCap()       // B2: corta o free ao vencer o cap de 2h
 		case <-hbT.C:
 			if len(t.open) > 0 {
 				// Re-arma o cap se a resposta trouxer hard_cap_at; falha transitoria de
