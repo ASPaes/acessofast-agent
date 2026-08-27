@@ -34,8 +34,8 @@
 param(
   # Alvo do bootstrap. NAO precisa ser a versao mais nova — basta ser >= 12/08/2026,
   # porque a partir dai o proprio agente busca o alvo global sozinho.
-  [string]$Version = '2026.08.18-7ada713',
-  [string]$Sha256  = '9bc5a3d2408144e4886e43fb09880226fcd12baa0756ada8e864ca53e01816b9'
+  [string]$Version = '2026.08.26-42498f5',
+  [string]$Sha256  = '1e9dc41578c841f2521ae64e21685dc08a70b0fc447fda8c00e0bc587bf3913d'
 )
 
 $ErrorActionPreference = 'Stop'
