@@ -56,6 +56,10 @@ permissions:
 env:
   # ---------------- Identidade AcessoFast (igual ao build-client.yml) ---------
   appname: "AcessoFast"
+  # Identificador do bundle: NOSSO, nao o do RustDesk. No macOS e ele que amarra
+  # as permissoes de Gravacao de Tela e Acessibilidade — herdar com.carriez.rustdesk
+  # faria a permissao concedida a um valer pro outro, ou nenhuma valer.
+  bundleid: "br.com.acessofast.client"
   compname: "AcessoFast"
 
   # ---------------- Plano de dados: relay proprio -----------------------------
@@ -219,7 +223,7 @@ jobs:
         shell: bash
         run: |
           cd "$(dirname "$(which flutter)")"
-          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          sed -i "" -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -251,14 +255,13 @@ jobs:
       # PATCHES AcessoFast — os mesmos do build-client.yml
       # ---------------------------------------------------------------------
       - name: Identidade — nome do app e da empresa
-        continue-on-error: true
         shell: bash
         run: |
-          sed -i -e 's|description = "RustDesk Remote Desktop"|description = "${{ env.appname }}"|' ./Cargo.toml
+          sed -i "" -e 's|description = "RustDesk Remote Desktop"|description = "${{ env.appname }}"|' ./Cargo.toml
           # Textos da interface. O powered_by_me leva o nome da EMPRESA; o resto, o do app.
-          find ./src/lang -name "*.rs" -exec sed -i '/powered_by_me/s|RustDesk|${{ env.compname }}|g' {} \;
-          find ./src/lang -name "*.rs" -exec sed -i -e 's|RustDesk|${{ env.appname }}|' {} \;
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/lib/desktop/pages/desktop_setting_page.dart
+          find ./src/lang -name "*.rs" -exec sed -i "" '/powered_by_me/s|RustDesk|${{ env.compname }}|g' {} \;
+          find ./src/lang -name "*.rs" -exec sed -i "" -e 's|RustDesk|${{ env.appname }}|' {} \;
+          sed -i "" -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/lib/desktop/pages/desktop_setting_page.dart
 
       # A identidade do macOS nao esta em nenhum arquivo que o build Windows toca.
       # PRODUCT_NAME e o que faz o bundle sair AcessoFast.app e instalar em
@@ -274,13 +277,27 @@ jobs:
         run: |
           set -euo pipefail
           x=./flutter/macos/Runner/Configs/AppInfo.xcconfig
-          sed -i -e 's|^PRODUCT_NAME = .*|PRODUCT_NAME = ${{ env.appname }}|' "$x"
-          sed -i -e 's|^PRODUCT_BUNDLE_IDENTIFIER = .*|PRODUCT_BUNDLE_IDENTIFIER = br.com.acessofast.client|' "$x"
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' "$x"
+          sed -i '' -e 's|^PRODUCT_NAME = .*|PRODUCT_NAME = ${{ env.appname }}|' "$x"
+          sed -i '' -e 's|^PRODUCT_BUNDLE_IDENTIFIER = .*|PRODUCT_BUNDLE_IDENTIFIER = ${{ env.bundleid }}|' "$x"
+          sed -i '' -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' "$x"
+
+          # O xcconfig NAO basta para o identificador: o project.pbxproj declara
+          # PRODUCT_BUNDLE_IDENTIFIER direto, e ajuste no .pbxproj vence o do
+          # xcconfig. Provado na primeira execucao — o bundle saiu AcessoFast.app
+          # (PRODUCT_NAME pegou) mas com id com.carriez.rustdesk (o outro nao).
+          p=./flutter/macos/Runner.xcodeproj/project.pbxproj
+          if ! grep -q "PRODUCT_BUNDLE_IDENTIFIER = com.carriez.rustdesk;" "$p"; then
+            echo "::error::PRODUCT_BUNDLE_IDENTIFIER nao encontrado no project.pbxproj — RustDesk mudou; revisar."
+            exit 1
+          fi
+          sed -i '' -e 's|PRODUCT_BUNDLE_IDENTIFIER = com.carriez.rustdesk;|PRODUCT_BUNDLE_IDENTIFIER = ${{ env.bundleid }};|g' "$p"
+
           # A secao de bundle do Cargo.toml alimenta o empacotador nativo.
-          sed -i -e 's|^name = "RustDesk"|name = "${{ env.appname }}"|' ./Cargo.toml
-          sed -i -e 's|^identifier = "com.carriez.rustdesk"|identifier = "br.com.acessofast.client"|' ./Cargo.toml
-          echo "--- AppInfo.xcconfig depois do patch:"; cat "$x"
+          sed -i '' -e 's|^name = "RustDesk"|name = "${{ env.appname }}"|' ./Cargo.toml
+          sed -i '' -e 's|^identifier = "com.carriez.rustdesk"|identifier = "${{ env.bundleid }}"|' ./Cargo.toml
+
+          echo "--- AppInfo.xcconfig:"; cat "$x"
+          echo "--- identificadores no project.pbxproj:"; grep -n "PRODUCT_BUNDLE_IDENTIFIER" "$p"
 
       # O build.py copia o binario do SERVICO (o helper root, que e o que recebe as
       # conexoes) para dentro do bundle — e tem "RustDesk.app" escrito na mao nesse
@@ -303,16 +320,16 @@ jobs:
             echo "::error::'$alvo' nao encontrado em build.py — RustDesk mudou o passo que instala o servico; revisar."
             exit 1
           fi
-          sed -i -e "s|Release/RustDesk.app/Contents/MacOS/|Release/${{ env.appname }}.app/Contents/MacOS/|g" build.py
+          sed -i "" -e "s|Release/RustDesk.app/Contents/MacOS/|Release/${{ env.appname }}.app/Contents/MacOS/|g" build.py
           echo "depois do patch:"; grep -n "Products/Release/.*\.app" build.py
 
       - name: Relay e chave (o cliente nao conecta em mais lugar nenhum)
         shell: bash
         run: |
           set -euo pipefail
-          sed -i -e 's|rs-ny.rustdesk.com|${{ env.server }}|' ./libs/hbb_common/src/config.rs
-          sed -i -e 's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${{ env.key }}|' ./libs/hbb_common/src/config.rs
-          sed -i -e 's|https://admin.rustdesk.com|${{ env.apiServer }}|' ./src/common.rs
+          sed -i "" -e 's|rs-ny.rustdesk.com|${{ env.server }}|' ./libs/hbb_common/src/config.rs
+          sed -i "" -e 's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${{ env.key }}|' ./libs/hbb_common/src/config.rs
+          sed -i "" -e 's|https://admin.rustdesk.com|${{ env.apiServer }}|' ./src/common.rs
           echo "conferindo que o relay entrou:"
           grep -n "${{ env.server }}" ./libs/hbb_common/src/config.rs | head -3
 
@@ -332,7 +349,7 @@ jobs:
           if grep -qF 'peer_id {}' "$f"; then
             echo "peer_id ja presente, pulando."
           else
-            sed -i -e 's|self.lr = lr.clone();|self.lr = lr.clone();\n        log::info!("#{} peer_id {}", self.inner.id, lr.my_id);|' "$f"
+            sed -i "" -e 's|self.lr = lr.clone();|self.lr = lr.clone();\n        log::info!("#{} peer_id {}", self.inner.id, lr.my_id);|' "$f"
           fi
           grep -n 'peer_id' "$f"
 
@@ -348,13 +365,28 @@ jobs:
           curl -fsSL -o removeSetupServerTip.diff https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/removeSetupServerTip.diff
           git apply removeSetupServerTip.diff || echo "::warning::removeSetupServerTip nao aplicou (cosmetico, segue)"
 
+      # Mata o popup "nova versao disponivel" do RustDesk. Num cliente que nao tem
+      # canal de update proprio, esse aviso so confunde: manda o usuario procurar
+      # atualizacao que nao existe, com o nome de outro produto.
+      #
+      # O -i vazio nao e enfeite. No sed do BSD (macOS) o -i EXIGE o sufixo de backup
+      # logo depois; sem ele, o script vira sufixo e o arquivo vira comando —
+      # "sed: 1: ./src/common.rs: invalid command code .". Foi assim que este passo
+      # falhou CALADO na primeira execucao: continue-on-error engoliu o erro, o build
+      # ficou verde e o popup teria continuado no cliente.
+      #
+      # Por isso tambem sai o continue-on-error e entra uma conferencia: erro de
+      # sintaxe agora quebra, e patch que nao pegou vira aviso visivel.
       - name: removeNewVersionNotif
-        continue-on-error: true
         if: env.removeNewVersionNotif == 'true'
         shell: bash
         run: |
-          sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
-          sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+          set -euo pipefail
+          sed -i "" -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
+          sed -i "" -e '/let (request, url) =/,/Ok(())/{/Ok(())/!d;}' ./src/common.rs
+          if grep -q "updateUrl.isNotEmpty" ./flutter/lib/desktop/pages/desktop_home_page.dart; then
+            echo "::warning::o patch do popup nao pegou no desktop_home_page.dart — o aviso de nova versao pode aparecer."
+          fi
 
       # ---------------------------------------------------------------------
       # Build
@@ -363,10 +395,10 @@ jobs:
         run: |
           if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
             MIN_MACOS_VERSION="12.3"
-            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
-            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
-            sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
-            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+            sed -i "" -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i "" -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+            sed -i "" -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+            sed -i "" -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
           fi
           ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra }}
 
@@ -423,7 +455,7 @@ jobs:
           app="$APP_BUNDLE"; nome="$(basename "$app")"
           CREATE_DMG="$(readlink -f "$(command -v create-dmg)")"
           # O create-dmg desiste de desmontar a imagem cedo demais em runner ocupado.
-          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          sed -i "" -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
           create-dmg --icon "$nome" 200 190 --hide-extension "$nome" \
             --window-size 800 400 --app-drop-link 600 185 \
             "AcessoFastClient-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg" "$app"
