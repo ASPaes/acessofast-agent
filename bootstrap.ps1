@@ -32,10 +32,21 @@
 
 [CmdletBinding()]
 param(
-  # Alvo do bootstrap. NAO precisa ser a versao mais nova — basta ser >= 12/08/2026,
-  # porque a partir dai o proprio agente busca o alvo global sozinho.
-  [string]$Version = '2026.08.26-42498f5',
-  [string]$Sha256  = '1e9dc41578c841f2521ae64e21685dc08a70b0fc447fda8c00e0bc587bf3913d'
+  # Alvo do bootstrap. Tecnicamente basta ser >= 12/08/2026, porque a partir dai o
+  # agente busca o alvo global sozinho — mas vale manter esta pin ATUAL, e por dois
+  # motivos que so aparecem depois de 28/08/2026:
+  #
+  # 1. presence. Ate a 2026.08.26 o batimento da maquina ociosa era 60s; da
+  #    2026.08.28 em diante e 180s. Com pin velha, cada maquina recem-bootstrapada
+  #    gasta 1.440 invocacoes/dia ate o auto-update alcança-la, em vez de 480.
+  #
+  # 2. rustdesk_id. O bootstrap NAO toca C:\ProgramData\AcessoFast de proposito, o
+  #    que preserva um rustdesk_id em cache que pode estar velho (cliente
+  #    reinstalado sorteia ID novo). A 2026.08.28 revalida esse cache no startup; a
+  #    anterior nao. Com pin velha, bootstrapar uma maquina nessa situacao a devolve
+  #    ao laco de matricula; com pin nova, o proprio bootstrap corrige.
+  [string]$Version = '2026.08.28-0ccb0e1',
+  [string]$Sha256  = '4f62389053b06f4f979259c46e2b9ff48254dbfe14944cb3577987fe570c5fb6'
 )
 
 $ErrorActionPreference = 'Stop'
