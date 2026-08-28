@@ -46,7 +46,7 @@
 ; instalador, maquina nova nunca mais precisa de sessao remota so por versao
 ; de agente: ela se declara no painel e obedece ao alvo de update.
 #define MyAppVersion     "3.1.1"
-#define MyAppPublisher   "ASP Softwares"
+#define MyAppPublisher   "AcessoFast"
 #define MyAppURL         "https://acessofast.com.br"
 #define AgentServiceName "AcessoFastAgent"
 
