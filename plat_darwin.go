@@ -33,6 +33,17 @@
 //   - O `ps` responde no IDIOMA da maquina: naquele Mac, "qui 20 ago 17:40:23 2026".
 //     Por isso o comando roda com LC_ALL=C (ver clientProcStartTime).
 //
+// Da PRIMEIRA COMPILACAO do cliente branded para macOS (26/08) e do fonte do
+// RustDesk 1.4.9:
+//
+//   - o bundle sai /Applications/AcessoFast.app, com o executavel em
+//     Contents/MacOS/AcessoFast e o custom_.txt ao lado dele;
+//   - os rotulos do launchd sao com.carriez.AcessoFast_service (daemon root) e
+//     com.carriez.AcessoFast_server (agente da sessao grafica) — ver abaixo;
+//   - o identificador do bundle e nosso (br.com.acessofast.client), separado do
+//     RustDesk oficial, o que mantem as permissoes de tela e acessibilidade
+//     separadas das dele.
+//
 // AINDA POR CONFIRMAR: onde o log cai quando o cliente roda como SERVICO instalado.
 // Na coleta o app rodava a partir do DMG montado, sem servico nenhum registrado no
 // launchd — entao o que se viu foi o log da sessao do USUARIO. Por isso os globs
@@ -65,10 +76,29 @@ const exeSuffix = ""
 // nunca consegue reiniciar o servico.
 const agentLaunchdLabel = "br.com.acessofast.agent"
 
-// clientLaunchdLabel: rotulo do LaunchDaemon do CLIENTE branded (o RustDesk server
-// que RECEBE as conexoes). CONFIRMAR: o RustDesk usa ORG "com.carriez" + APP_NAME
-// no macOS, e o build branded troca o APP_NAME para AcessoFast.
-const clientLaunchdLabel = "com.carriez.AcessoFast"
+// Rotulos do launchd do CLIENTE branded. Nao sao chute: saem do fonte do RustDesk
+// 1.4.9 (src/platform/macos.rs), que monta os arquivos como
+//
+//	/Library/LaunchDaemons/{get_full_name()}_service.plist
+//	/Library/LaunchAgents/{get_full_name()}_server.plist
+//
+// com get_full_name() = "{ORG}.{APP_NAME}" (src/common.rs). O ORG e "com.carriez" e
+// o build branded NAO o troca; o APP_NAME vem do custom_.txt. Da "com.carriez.AcessoFast".
+//
+// SAO DOIS, e a diferenca decide como se reinicia cada um:
+//
+//	_service  LaunchDaemon, roda como root no dominio "system". E o que atende a
+//	          tela de login (acesso antes de alguem logar).
+//	_server   LaunchAgent, roda na SESSAO GRAFICA do usuario, no dominio
+//	          "gui/<uid>". E ELE que recebe a sessao e escreve o log de conexao.
+//
+// Foi por isso que a coleta de campo (20/08) achou o log em
+// /Users/<usuario>/Library/Logs e nao no home do root: quem loga a conexao vive na
+// sessao do usuario. Um kickstart em "system/..." nunca alcancaria esse processo.
+const (
+	clientDaemonLabel = "com.carriez.AcessoFast_service"
+	clientAgentLabel  = "com.carriez.AcessoFast_server"
+)
 
 // clientAppExe: o binario dentro do bundle. No macOS o cliente e um .app, e o
 // executavel de verdade fica em Contents/MacOS — e ele que aceita --get-id e
@@ -214,21 +244,56 @@ func clientProcStartTime() (time.Time, bool) {
 	return parseLstart(string(out), time.Local)
 }
 
-// restartClientService reinicia o LaunchDaemon do cliente branded. Billing B2: e o
-// corte DURO do free — derrubar o daemon derruba a sessao ativa; ao subir, o cliente
+// restartClientService reinicia o cliente branded. Billing B2: e o corte DURO do
+// free — derrubar quem segura a conexao derruba a sessao ativa; ao subir, o cliente
 // recarrega a config com a senha JA rotacionada.
 //
-// kickstart -k mata e sobe de novo numa chamada so; o -k existe exatamente pra este
-// caso e evita a corrida do "stop e depois start" (em que o launchd ainda esta
-// desmontando o servico quando o start chega).
+// kickstart -k mata e sobe numa chamada so; o -k existe pra este caso e evita a
+// corrida do "stop e depois start", em que o launchd ainda esta desmontando o
+// servico quando o start chega.
+//
+// A ORDEM importa: primeiro o LaunchAgent do usuario, que e quem segura a sessao.
+// E ele NAO vive no dominio "system" — o agente roda como root, mas um LaunchAgent
+// so existe dentro da sessao grafica, entao o alvo e "gui/<uid>".
 func restartClientService() {
-	alvo := "system/" + clientLaunchdLabel
-	out, err := exec.Command("launchctl", "kickstart", "-k", alvo).CombinedOutput()
-	if err != nil {
-		logln("CUT: launchctl kickstart %s falhou: %v (%s)", alvo, err, strings.TrimSpace(string(out)))
-		return
+	if uid, ok := uidDoConsole(); ok {
+		alvo := fmt.Sprintf("gui/%d/%s", uid, clientAgentLabel)
+		out, err := exec.Command("launchctl", "kickstart", "-k", alvo).CombinedOutput()
+		if err != nil {
+			logln("CUT: kickstart %s falhou: %v (%s)", alvo, err, strings.TrimSpace(string(out)))
+		} else {
+			logln("CUT: %s reiniciado — sessao derrubada, senha nova ativa", alvo)
+		}
+	} else {
+		logln("CUT: ninguem logado na interface grafica — nao ha LaunchAgent do cliente pra reiniciar")
 	}
-	logln("CUT: daemon %s reiniciado — sessao derrubada, senha nova ativa", clientLaunchdLabel)
+
+	// O daemon root tambem volta: e ele que atende a tela de login. Pode nem estar
+	// instalado (o usuario so ativa o servico se quiser acesso desatendido), entao
+	// falhar aqui nao e motivo de alarme — so registra.
+	alvoDaemon := "system/" + clientDaemonLabel
+	if out, err := exec.Command("launchctl", "kickstart", "-k", alvoDaemon).CombinedOutput(); err != nil {
+		logln("CUT: kickstart %s: %v (%s)", alvoDaemon, err, strings.TrimSpace(string(out)))
+	}
+}
+
+// uidDoConsole devolve o uid de quem esta na frente da maquina, logado na interface
+// grafica. O dono de /dev/console E esse usuario — e a forma classica de descobrir
+// isso no macOS, sem depender de nada instalado.
+//
+// (0, false) quando ninguem esta logado (maquina na tela de login) ou quando a
+// leitura falha. Nesse caso nao existe LaunchAgent de usuario para reiniciar, e o
+// chamador nao age — mesmo principio do resto do arquivo: quem nao sabe, nao mexe.
+func uidDoConsole() (int, bool) {
+	out, err := exec.Command("stat", "-f", "%u", "/dev/console").Output()
+	if err != nil {
+		return 0, false
+	}
+	uid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || uid == 0 {
+		return 0, false
+	}
+	return uid, true
 }
 
 // ---------------------------------------------------------------------------
