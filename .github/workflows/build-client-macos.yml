@@ -420,6 +420,34 @@ jobs:
           echo -n "${{ env.custom }}" > "$app/Contents/MacOS/custom_.txt"
           echo "APP_BUNDLE=$app" >> "$GITHUB_ENV"
 
+      # SEM ESTE PASSO O APP NAO ABRE. Provado em Mac real (27/08):
+      #
+      #   dyld: Library not loaded: @rpath/FlutterMacOS.framework/.../FlutterMacOS
+      #   Reason: code signature not valid for use in process: mapping process and
+      #           mapped file (non-platform) have different Team IDs
+      #
+      # O FlutterMacOS.framework vem de fabrica assinado pelo Google, com Team ID
+      # proprio. O executavel principal, que o Xcode assina em ad-hoc quando nao ha
+      # certificado, nao tem Team ID nenhum. Em Apple Silicon o dyld recusa carregar
+      # biblioteca cujo Team ID nao bate com o do processo — e o app morre antes de
+      # desenhar a janela.
+      #
+      # A ORDEM IMPORTA, e vai continuar importando quando o certificado chegar:
+      # assinar SELA o conteudo do bundle, entao qualquer arquivo colocado depois (o
+      # custom_.txt, por exemplo) invalida a assinatura. Por isso a assinatura vem
+      # depois do custom_.txt, nunca antes.
+      #
+      # Com Developer ID este passo troca o "-" pela identidade e ganha
+      # --options runtime. O --deep sai de cena la: para distribuicao a Apple exige
+      # assinar de dentro pra fora. Em ad-hoc, para teste nosso, ele basta.
+      - name: Assinar o bundle (ad-hoc — e o que faz o app abrir)
+        shell: bash
+        run: |
+          set -euo pipefail
+          codesign --force --deep --sign - "$APP_BUNDLE"
+          codesign --verify --deep --verbose=2 "$APP_BUNDLE" 2>&1 | tail -3
+          echo "::notice::bundle reassinado em ad-hoc — abre na maquina, mas NAO passa no Gatekeeper de quem baixa"
+
       # Este passo existe pra responder, SEM precisar de um Mac na mao, as perguntas
       # que ainda estao abertas no plat_darwin.go. Sai como anotacao (::notice::)
       # porque anotacao aparece na API publica do repo, e log de run nao.
