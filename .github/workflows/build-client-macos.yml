@@ -56,7 +56,7 @@ permissions:
 env:
   # ---------------- Identidade AcessoFast (igual ao build-client.yml) ---------
   appname: "AcessoFast"
-  compname: "ASP Softwares"
+  compname: "AcessoFast"
 
   # ---------------- Plano de dados: relay proprio -----------------------------
   server: "${{ vars.RELAY_HOST }}"
