@@ -282,6 +282,30 @@ jobs:
           sed -i -e 's|^identifier = "com.carriez.rustdesk"|identifier = "br.com.acessofast.client"|' ./Cargo.toml
           echo "--- AppInfo.xcconfig depois do patch:"; cat "$x"
 
+      # O build.py copia o binario do SERVICO (o helper root, que e o que recebe as
+      # conexoes) para dentro do bundle — e tem "RustDesk.app" escrito na mao nesse
+      # caminho. Com o PRODUCT_NAME ja renomeando o bundle para AcessoFast.app, o cp
+      # aponta para uma pasta que nao existe e o build morre DEPOIS de 14 minutos,
+      # com o app pronto:
+      #
+      #   ✓ Built .../Release/AcessoFast.app (57.0MB)
+      #   cp: directory .../Release/RustDesk.app/Contents/MacOS does not exist
+      #
+      # A guarda e a mesma do patch de peer_id: se a linha mudar numa versao nova do
+      # RustDesk, abortar aqui e melhor do que entregar um bundle SEM o servico — que
+      # instala, abre, e simplesmente nao aceita conexao nenhuma.
+      - name: Corrigir o nome do bundle dentro do build.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          alvo='Release/RustDesk.app/Contents/MacOS/'
+          if ! grep -qF "$alvo" build.py; then
+            echo "::error::'$alvo' nao encontrado em build.py — RustDesk mudou o passo que instala o servico; revisar."
+            exit 1
+          fi
+          sed -i -e "s|Release/RustDesk.app/Contents/MacOS/|Release/${{ env.appname }}.app/Contents/MacOS/|g" build.py
+          echo "depois do patch:"; grep -n "Products/Release/.*\.app" build.py
+
       - name: Relay e chave (o cliente nao conecta em mais lugar nenhum)
         shell: bash
         run: |
