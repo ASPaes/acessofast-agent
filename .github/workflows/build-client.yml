@@ -63,7 +63,7 @@ env:
 
   # ---------------- Identidade AcessoFast (antes vinha do zip do rdgen) -------
   appname: "AcessoFast"
-  compname: "ASP Softwares"
+  compname: "AcessoFast"
   filename: "AcessoFastClient"
 
   # ---------------- Plano de dados: relay proprio -----------------------------

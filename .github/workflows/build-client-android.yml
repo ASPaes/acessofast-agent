@@ -73,7 +73,7 @@ env:
 
   # ---------------- Identidade AcessoFast (igual ao build Windows) ------------
   appname: "AcessoFast"
-  compname: "ASP Softwares"
+  compname: "AcessoFast"
 
   # applicationId do APK. TROCADO de propósito: o upstream usa
   # com.carriez.flutter_hbb, que (a) colide com o RustDesk oficial no mesmo
