@@ -1,0 +1,435 @@
+name: Build AcessoFast Client (macOS)
+run-name: "AcessoFast Client macOS — RustDesk ${{ inputs.version }} (${{ inputs.arquiteturas }})"
+
+# Compila o CLIENTE branded para macOS: o RustDesk oficial na tag pedida, com a
+# identidade AcessoFast, o relay e a chave embutidos, e o patch de peer_id que a
+# auto-adocao usa. Sai um .app dentro de um .dmg.
+#
+# ARQUIVO SEPARADO, e nao um job dentro do build-client.yml, pela mesma razao do
+# agente: aquele workflow monta o cliente Windows que esta em producao e alimenta o
+# instalador. Nao vale a pena arriscar a peca que ja funciona para acomodar a que
+# ainda esta nascendo.
+#
+# OS PATCHES SAO OS MESMOS do build-client.yml, copiados e nao reinventados — em
+# especial os tres que decidem se o cliente presta:
+#
+#   1. server/key no config.rs  — sem isso o cliente nao acha o relay de ninguem;
+#   2. peer_id no connection.rs — a linha que o agente le pra auto-adocao;
+#   3. allowCustom.py           — remove a verificacao RSA que exigiria a chave
+#                                 privada do RustDesk, e e o que permite o
+#                                 custom_.txt (identidade AcessoFast) funcionar.
+#
+# O QUE E DIFERENTE NO macOS, e por isso este arquivo existe:
+#
+#   - a identidade do app nao esta num .rc do Windows, e sim no AppInfo.xcconfig
+#     (PRODUCT_NAME e PRODUCT_BUNDLE_IDENTIFIER) e na secao [package.metadata.bundle]
+#     do Cargo.toml. E o PRODUCT_NAME que faz o app instalar como
+#     /Applications/AcessoFast.app — caminho que o agente procura (plat_darwin.go).
+#   - o custom_.txt vai DENTRO do bundle, ao lado do executavel em Contents/MacOS/.
+#   - o build sai por ./build.py --flutter, nao pelo empacotador portatil.
+#
+# ESTE BUILD NAO E ASSINADO. Sem o certificado Developer ID o .dmg nao passa no
+# Gatekeeper de quem baixa — serve para NOSSO teste, nao para cliente. Quando o
+# certificado existir, a assinatura entra aqui e a notarizacao no .pkg.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag do RustDesk a buildar (a mesma do cliente Windows)"
+        required: true
+        default: "1.4.9"
+        type: string
+      arquiteturas:
+        description: "Quais Macs atender"
+        required: true
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - intel
+          - ambos
+
+permissions:
+  contents: read
+
+env:
+  # ---------------- Identidade AcessoFast (igual ao build-client.yml) ---------
+  appname: "AcessoFast"
+  compname: "ASP Softwares"
+
+  # ---------------- Plano de dados: relay proprio -----------------------------
+  server: "${{ vars.RELAY_HOST }}"
+  key: "${{ vars.RELAY_PUBKEY }}"
+  # SOBERANIA: vazio de proposito — o RustDesk vem com admin.rustdesk.com embutido.
+  apiServer: ""
+
+  # ---------------- custom_.txt: a identidade do cliente ----------------------
+  # MESMO base64 do build-client.yml. Decodificado:
+  # {"app-name":"AcessoFast","override-settings":{"approve-mode":"password-click",
+  #  "allow-remote-config-modification":"N","allow-logon-screen-password":"Y"}}
+  #
+  # 'app-name' define config::APP_NAME em runtime, e no macOS e ele que decide o
+  # namespace de config (~/Library/Preferences/com.carriez.AcessoFast) e o de log
+  # (~/Library/Logs/AcessoFast) — os dois caminhos que o agente le.
+  custom: "eyJhcHAtbmFtZSI6IkFjZXNzb0Zhc3QiLCJvdmVycmlkZS1zZXR0aW5ncyI6eyJhcHByb3ZlLW1vZGUiOiJwYXNzd29yZC1jbGljayIsImFsbG93LXJlbW90ZS1jb25maWctbW9kaWZpY2F0aW9uIjoiTiIsImFsbG93LWxvZ29uLXNjcmVlbi1wYXNzd29yZCI6IlkifX0="
+
+  removeNewVersionNotif: "true"
+
+  # ---------------- Versoes (as do proprio CI do RustDesk 1.4.9) --------------
+  # MAC_RUST_VERSION e 1.81 e nao 1.75 como no Windows: o cidre, dependencia so do
+  # macOS, exige 1.81. Copiar o 1.75 do build Windows quebraria a compilacao.
+  MAC_RUST_VERSION: "1.81"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "${{ inputs.version }}"
+
+jobs:
+  # Mesmo guard do build-client.yml: sem as vars, o sed troca o relay por string
+  # VAZIA, o build fica verde e entrega um cliente que nao conecta em lugar nenhum.
+  # Custa segundos e evita perder uma hora de runner.
+  preflight:
+    name: Verificar configuracao
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vars obrigatorias (RELAY_HOST / RELAY_PUBKEY)
+        run: |
+          erro=0
+          if [ -z "${{ vars.RELAY_HOST }}" ]; then
+            echo "::error::RELAY_HOST vazio. Settings > Secrets and variables > Actions > aba VARIABLES."
+            erro=1
+          fi
+          if [ -z "${{ vars.RELAY_PUBKEY }}" ]; then
+            echo "::error::RELAY_PUBKEY vazio. Mesma aba VARIABLES."
+            erro=1
+          fi
+          if [ -z "${{ env.custom }}" ]; then
+            echo "::error::env.custom vazio — o cliente sairia identificado como RustDesk."
+            erro=1
+          fi
+          if [ "$erro" -ne 0 ]; then exit 1; fi
+          echo "relay = ${{ vars.RELAY_HOST }}"
+          echo -n "custom_.txt decodificado: "; echo -n "${{ env.custom }}" | base64 -d; echo ""
+
+  # Qual Mac atender. Sai como JSON pra matriz do job de build.
+  matriz:
+    name: Definir arquiteturas
+    needs: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      job: ${{ steps.definir.outputs.job }}
+    steps:
+      - id: definir
+        run: |
+          # os runners: macos-14 e Apple Silicon; macos-15-intel e o x86_64.
+          arm='{"target":"aarch64-apple-darwin","os":"macos-14","arch":"aarch64","vcpkg":"arm64-osx","extra":"--screencapturekit"}'
+          intel='{"target":"x86_64-apple-darwin","os":"macos-15-intel","arch":"x86_64","vcpkg":"x64-osx","extra":""}'
+          case "${{ inputs.arquiteturas }}" in
+            intel) m="[$intel]" ;;
+            ambos) m="[$arm,$intel]" ;;
+            *)     m="[$arm]" ;;
+          esac
+          echo "job=$m" >> "$GITHUB_OUTPUT"
+          echo "matriz: $m"
+
+  generate-bridge:
+    needs: preflight
+    uses: ./.github/workflows/bridge.yml
+    with:
+      version: ${{ inputs.version }}
+
+  build:
+    name: ${{ matrix.job.arch }}
+    needs: [matriz, generate-bridge]
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.matriz.outputs.job) }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # CRITICO (igual ao build Windows): o checkout do rustdesk/rustdesk adiante
+      # sobrescreve o workspace e apagaria ./branding/. Salva fora antes.
+      - name: Preservar branding fora do workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/af-branding"
+          for f in icon.png logo.png; do
+            if [ ! -f "./branding/$f" ]; then
+              echo "::error::./branding/$f nao existe no repo. O build sairia com a marca do RustDesk."
+              exit 1
+            fi
+            cp "./branding/$f" "$RUNNER_TEMP/af-branding/$f"
+          done
+          echo "AF_BRANDING=$RUNNER_TEMP/af-branding" >> "$GITHUB_ENV"
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout RustDesk
+        uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: refs/tags/${{ env.VERSION }}
+          submodules: recursive
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@master
+        with:
+          name: bridge-artifact
+          path: ./
+
+      # ---------------------------------------------------------------------
+      # Dependencias de build (as mesmas do CI do RustDesk)
+      # ---------------------------------------------------------------------
+      - name: Install build runtime
+        run: |
+          brew install llvm create-dmg
+          if ! command -v pkg-config &>/dev/null; then brew install pkg-config; fi
+
+      - name: Install NASM
+        run: |
+          # NASM 2.16 de proposito: o `brew install nasm` traz a 3.x, que e uma
+          # reescrita com CLI incompativel, e o aom (codec) nao compila com ela.
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip -q nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ matrix.job.os }}
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r log; do
+              echo "$log:"; echo "======"; cat "$log"; echo "======"
+            done
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      # PATCHES AcessoFast — os mesmos do build-client.yml
+      # ---------------------------------------------------------------------
+      - name: Identidade — nome do app e da empresa
+        continue-on-error: true
+        shell: bash
+        run: |
+          sed -i -e 's|description = "RustDesk Remote Desktop"|description = "${{ env.appname }}"|' ./Cargo.toml
+          # Textos da interface. O powered_by_me leva o nome da EMPRESA; o resto, o do app.
+          find ./src/lang -name "*.rs" -exec sed -i '/powered_by_me/s|RustDesk|${{ env.compname }}|g' {} \;
+          find ./src/lang -name "*.rs" -exec sed -i -e 's|RustDesk|${{ env.appname }}|' {} \;
+          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/lib/desktop/pages/desktop_setting_page.dart
+
+      # A identidade do macOS nao esta em nenhum arquivo que o build Windows toca.
+      # PRODUCT_NAME e o que faz o bundle sair AcessoFast.app e instalar em
+      # /Applications/AcessoFast.app — exatamente o caminho que o agente procura.
+      #
+      # PRODUCT_BUNDLE_IDENTIFIER passa a ser NOSSO. Herdar com.carriez.flutterHbb
+      # faria o app dividir identidade com o RustDesk oficial, e no macOS o
+      # identificador do bundle e o que amarra as permissoes de Gravacao de Tela e
+      # Acessibilidade: um cliente com as duas coisas instaladas teria as permissoes
+      # de um valendo pro outro, ou nenhuma valendo.
+      - name: Identidade do bundle macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          x=./flutter/macos/Runner/Configs/AppInfo.xcconfig
+          sed -i -e 's|^PRODUCT_NAME = .*|PRODUCT_NAME = ${{ env.appname }}|' "$x"
+          sed -i -e 's|^PRODUCT_BUNDLE_IDENTIFIER = .*|PRODUCT_BUNDLE_IDENTIFIER = br.com.acessofast.client|' "$x"
+          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' "$x"
+          # A secao de bundle do Cargo.toml alimenta o empacotador nativo.
+          sed -i -e 's|^name = "RustDesk"|name = "${{ env.appname }}"|' ./Cargo.toml
+          sed -i -e 's|^identifier = "com.carriez.rustdesk"|identifier = "br.com.acessofast.client"|' ./Cargo.toml
+          echo "--- AppInfo.xcconfig depois do patch:"; cat "$x"
+
+      - name: Relay e chave (o cliente nao conecta em mais lugar nenhum)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i -e 's|rs-ny.rustdesk.com|${{ env.server }}|' ./libs/hbb_common/src/config.rs
+          sed -i -e 's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${{ env.key }}|' ./libs/hbb_common/src/config.rs
+          sed -i -e 's|https://admin.rustdesk.com|${{ env.apiServer }}|' ./src/common.rs
+          echo "conferindo que o relay entrou:"
+          grep -n "${{ env.server }}" ./libs/hbb_common/src/config.rs | head -3
+
+      # A linha que a auto-adocao le. O log padrao do RustDesk so tem o IP do peer;
+      # o rustdesk_id dele (lr.my_id) so existe APOS o LoginRequest. Identico ao
+      # patch do build Windows, guarda inclusive.
+      - name: log peer_id no connection.rs (auto-adocao)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./src/server/connection.rs
+          anchor='self.lr = lr.clone();'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora '$anchor' nao encontrada em $f — RustDesk mudou; revisar o patch de peer_id."
+            exit 1
+          fi
+          if grep -qF 'peer_id {}' "$f"; then
+            echo "peer_id ja presente, pulando."
+          else
+            sed -i -e 's|self.lr = lr.clone();|self.lr = lr.clone();\n        log::info!("#{} peer_id {}", self.inner.id, lr.my_id);|' "$f"
+          fi
+          grep -n 'peer_id' "$f"
+
+      # Sem este patch o custom_.txt nao vale nada: o canal oficial (custom.txt)
+      # exige assinatura RSA da chave privada do RustDesk. O allowCustom.py remove a
+      # verificacao e renomeia para custom_.txt DENTRO do codigo — dai o underscore.
+      - name: allow custom.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o allowCustom.py https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allowCustom.py
+          python3 allowCustom.py
+          curl -fsSL -o removeSetupServerTip.diff https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/removeSetupServerTip.diff
+          git apply removeSetupServerTip.diff || echo "::warning::removeSetupServerTip nao aplicou (cosmetico, segue)"
+
+      - name: removeNewVersionNotif
+        continue-on-error: true
+        if: env.removeNewVersionNotif == 'true'
+        shell: bash
+        run: |
+          sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
+          sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+
+      # ---------------------------------------------------------------------
+      # Build
+      # ---------------------------------------------------------------------
+      - name: Build rustdesk
+        run: |
+          if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
+            MIN_MACOS_VERSION="12.3"
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+            sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+          fi
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra }}
+
+      # O custom_.txt guarda o base64 CRU (nao decodificado) e mora ao lado do
+      # executavel — no macOS, dentro de Contents/MacOS/. Sem ele o APP_NAME volta a
+      # ser "RustDesk" e o cliente passa a ler ~/Library/Preferences/com.carriez.RustDesk,
+      # colidindo com uma instalacao oficial e, pior pra nos, deixando o agente
+      # procurando log num caminho que ninguem escreve.
+      - name: Gravar custom_.txt dentro do bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$(find ./flutter/build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
+          if [ -z "$app" ]; then
+            echo "::error::nenhum .app em Products/Release — o build nao produziu bundle."
+            exit 1
+          fi
+          echo "bundle: $app"
+          echo -n "${{ env.custom }}" > "$app/Contents/MacOS/custom_.txt"
+          echo "APP_BUNDLE=$app" >> "$GITHUB_ENV"
+
+      # Este passo existe pra responder, SEM precisar de um Mac na mao, as perguntas
+      # que ainda estao abertas no plat_darwin.go. Sai como anotacao (::notice::)
+      # porque anotacao aparece na API publica do repo, e log de run nao.
+      - name: Radiografia do bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$APP_BUNDLE"
+          plist="$app/Contents/Info.plist"
+          nome="$(basename "$app")"
+          bid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null || echo '?')"
+          exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist" 2>/dev/null || echo '?')"
+          echo "::notice::bundle=${nome} id=${bid} executavel=${exe}"
+          if [ -f "$app/Contents/MacOS/custom_.txt" ]; then
+            echo "::notice::custom_.txt presente em Contents/MacOS ($(wc -c < "$app/Contents/MacOS/custom_.txt") bytes)"
+          else
+            echo "::error::custom_.txt NAO ficou no bundle"
+          fi
+          # Qualquer plist de servico embutido diz como o cliente se registra no
+          # launchd — e desse rotulo que o agente precisa (clientLaunchdLabel).
+          encontrados="$(find "$app" -name '*.plist' | grep -iE 'launch|daemon|agent' || true)"
+          if [ -n "$encontrados" ]; then
+            echo "$encontrados" | head -5 | while IFS= read -r p; do echo "::notice::plist de servico: ${p#$app/}"; done
+          else
+            echo "::notice::nenhum plist de servico dentro do bundle (o servico deve ser criado em tempo de instalacao)"
+          fi
+          echo "--- arvore do topo do bundle:"; ls -la "$app/Contents/MacOS/"
+
+      - name: Criar .dmg (sem assinatura)
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$APP_BUNDLE"; nome="$(basename "$app")"
+          CREATE_DMG="$(readlink -f "$(command -v create-dmg)")"
+          # O create-dmg desiste de desmontar a imagem cedo demais em runner ocupado.
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          create-dmg --icon "$nome" 200 190 --hide-extension "$nome" \
+            --window-size 800 400 --app-drop-link 600 185 \
+            "AcessoFastClient-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg" "$app"
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: acessofast-client-macos-${{ matrix.job.arch }}
+          path: AcessoFastClient-*.dmg
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Resumo
+        shell: bash
+        run: |
+          {
+            echo "## Cliente macOS ${{ matrix.job.arch }} — RustDesk ${{ env.VERSION }}"
+            echo
+            echo "Baixe em **Artifacts -> acessofast-client-macos-${{ matrix.job.arch }}**."
+            echo
+            echo "### NAO ASSINADO"
+            echo
+            echo "Sem certificado Developer ID, o Gatekeeper recusa este .dmg em maquina de"
+            echo "cliente. Para o NOSSO teste, abrir exige liberar em Ajustes do Sistema >"
+            echo "Privacidade e Seguranca."
+            echo
+            echo "### O que este build precisa provar"
+            echo
+            echo "1. o app instala como \`/Applications/AcessoFast.app\`;"
+            echo "2. o log de sessao sai em \`~/Library/Logs/AcessoFast/\` com as linhas"
+            echo "   \`#N Connection opened/closed\` — os caminhos do \`plat_darwin.go\`;"
+            echo "3. o rotulo com que o cliente se registra no launchd."
+          } >> "$GITHUB_STEP_SUMMARY"
