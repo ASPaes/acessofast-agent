@@ -92,9 +92,11 @@ jobs:
           rc=$?
           echo "$saida"
           if [ $rc -ne 0 ]; then
-            echo "$saida" \
-              | grep -aE "FAIL|panic:|cannot|undefined|no required module|build constraints|Error|error:" \
-              | tail -10 \
+            # SEM filtro por palavra-chave. A primeira versao filtrava por FAIL/panic
+            # e engoliu justamente a linha que explicava: o binario morria em 0.002s,
+            # antes de rodar teste nenhum, e a causa nao continha nenhuma daquelas
+            # palavras. Quando nao se sabe o que procurar, filtrar e apagar a pista.
+            echo "$saida" | tail -10 \
               | while IFS= read -r linha; do echo "::error::teste: ${linha}"; done
           fi
           exit $rc
