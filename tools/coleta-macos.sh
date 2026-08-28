@@ -62,7 +62,15 @@ echo "----- 4. Processos e o formato do 'ps' -------------------------"
 # Mac responder com mes/dia em PORTUGUES, o parser precisa mudar — e so daqui da pra
 # saber, porque depende do idioma da maquina.
 ps -axo pid,user,lstart,comm | grep -i "[r]ustdesk" || echo "(nenhum processo RustDesk rodando)"
-PID=$(pgrep -f "/Applications/RustDesk.app/Contents/MacOS/RustDesk" 2>/dev/null | head -1)
+# Prefere o AcessoFast (cliente branded); cai pro RustDesk oficial se for ele que
+# estiver instalado.
+APP=""
+for cand in /Applications/AcessoFast.app /Applications/RustDesk.app; do
+	[ -d "$cand" ] && APP="$cand" && break
+done
+EXEBASE="$(basename "${APP%.app}" 2>/dev/null)"
+PID=""
+[ -n "$APP" ] && PID=$(pgrep -f "$APP/Contents/MacOS/$EXEBASE" 2>/dev/null | head -1)
 if [ -n "$PID" ]; then
 	echo "PID escolhido: $PID"
 	echo "saida crua do 'ps -o lstart=' -> [$(ps -o lstart= -p "$PID")]"
@@ -135,6 +143,8 @@ EXE=""
 [ -x /Applications/AcessoFast.app/Contents/MacOS/AcessoFast ] && EXE=/Applications/AcessoFast.app/Contents/MacOS/AcessoFast
 if [ -n "$EXE" ]; then
 	echo "--get-id -> [$("$EXE" --get-id 2>&1 | head -2)]"
+	echo "(o LC_ALL=C mostra como o agente vai ler o ps:)"
+	[ -n "$PID" ] && echo "ps com LC_ALL=C -> [$(LC_ALL=C ps -o lstart= -p "$PID")]"
 else
 	echo "(executavel nao encontrado)"
 fi
