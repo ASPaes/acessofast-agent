@@ -84,8 +84,27 @@ jobs:
       # O filtro escolhe as linhas que dizem ALGO (FAIL, erro de compilacao, panic) e
       # corta em 10: o GitHub descarta anotacao alem disso, e despejar o -v inteiro
       # gastaria o limite com linhas de teste que passaram.
+      # Vira anotacao (::notice::), que sai na API publica junto do resultado. Sem
+      # isto, saber com que Go e em que macOS a run quebrou exige abrir o navegador.
+      - name: Ambiente
+        shell: bash
+        run: |
+          echo "::notice::${RUNNER_OS}: $(go version)"
+          echo "::notice::${RUNNER_OS}: cgo=$(go env CGO_ENABLED) cc=$(go env CC) arch=$(go env GOARCH)"
+
+      # CGO_ENABLED=0 NAO e detalhe de teste: e a configuracao que o produto USA.
+      # Tanto o build-agent.yml quanto o build-agent-macos.yml compilam o agente com
+      # cgo desligado, e e assim que o binario chega no cliente.
+      #
+      # Com cgo LIGADO (o padrao do `go test` nativo no macOS) a linkagem passa pelo
+      # linker da Apple, e foi ele que produziu um binario de teste sem LC_UUID — que
+      # o dyld recusa carregar ("missing LC_UUID load command", abort trap em 0.002s,
+      # antes de rodar teste nenhum). Ou seja: o CI estava quebrando num caminho de
+      # compilacao que nunca chega em cliente.
       - name: Testes (nativos deste sistema)
         shell: bash
+        env:
+          CGO_ENABLED: "0"
         run: |
           set +e
           saida="$(go test ./... -v 2>&1)"
