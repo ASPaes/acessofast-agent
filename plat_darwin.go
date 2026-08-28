@@ -21,7 +21,7 @@
 //
 //   - Os marcadores de sessao EXISTEM no macOS, no mesmo formato do Windows e
 //     vindos do mesmo lugar do fonte:
-//       [.. -03:00] DEBUG [src/server/connection.rs:1377] #899 Connection opened from 192.168.35.148:50328.
+//     [.. -03:00] DEBUG [src/server/connection.rs:1377] #899 Connection opened from 192.168.35.148:50328.
 //     A deteccao de sessao do agente vale nos dois sistemas.
 //
 //   - O log NAO fica numa subpasta "server", como no Windows. Fica na RAIZ de

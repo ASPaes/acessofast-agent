@@ -49,6 +49,12 @@ const (
 	rotateRetryIdle    = 5 * time.Minute
 	rotateRetryFastFor = 2 * time.Minute
 	rotateRetrySlowFor = 10 * time.Minute
+
+	// Espera pelo servico do cliente antes de rotacionar no boot (ver esperaCliente).
+	// O limite e generoso porque a maquina no boot esta disputando disco com tudo; se
+	// estourar, nao rotacionamos — o restart do cliente re-sincroniza depois.
+	esperaClienteTick   = 3 * time.Second
+	esperaClienteLimite = 5 * time.Minute
 )
 
 // Caminhos derivados do baseDir, que e por plataforma (plat_windows.go / plat_darwin.go).
@@ -161,6 +167,31 @@ func writePending(pw string) error {
 func readPending() string { return readTrim(pendingFile) }
 func clearPending()       { _ = os.Remove(pendingFile) }
 
+// clienteVivo: o servico do cliente branded esta rodando? clientProcPID e por
+// plataforma (SCM no Windows, launchd no macOS) e ja devolve false para leitura
+// duvidosa — que aqui tratamos como "nao rotaciona", o lado seguro.
+func clienteVivo() bool {
+	_, ok := clientProcPID()
+	return ok
+}
+
+// esperaCliente aguarda o servico do cliente subir, ate o limite. Existe por causa do
+// BOOT: agente e cliente sao servicos independentes e sobem em paralelo, entao o
+// rotate-on-boot quase sempre chegava primeiro e aplicava a senha no vazio. Esperar
+// troca uma rotacao imediata (que nao funcionava) por uma que funciona.
+func esperaCliente(limite time.Duration) bool {
+	fim := time.Now().Add(limite)
+	for {
+		if clienteVivo() {
+			return true
+		}
+		if !time.Now().Before(fim) {
+			return false
+		}
+		time.Sleep(esperaClienteTick)
+	}
+}
+
 // rotateNow gira a senha ao fim de uma sessao. Chamar em goroutine: faz exec + HTTP
 // e nao pode bloquear o poll de deteccao de sessao.
 func rotateNow() {
@@ -174,6 +205,26 @@ func rotateNow() {
 	exe, err := findRustDeskExe()
 	if err != nil {
 		logln("ROTATE ABORT: cliente branded nao encontrado: %v", err)
+		return
+	}
+
+	// GATE (25/08/2026) — sem o servico do cliente RODANDO nao se rotaciona.
+	//
+	// O --password entrega a senha ao servico do cliente. Com o servico parado nao ha
+	// quem receba, mas o comando ainda pode sair com codigo 0: o agente conclui que
+	// aplicou, reporta ao painel, e o painel passa a servir uma senha que a maquina
+	// NUNCA teve. Quando o servico sobe, ele carrega a senha ANTIGA do disco e todo
+	// acesso vira "Senha incorreta" — divergencia permanente ate alguem intervir.
+	//
+	// Foi o caso BOMBONIERI03 (25/08/2026): servico parado, rotate-on-boot as 16:44
+	// aplicou no vazio, e a maquina ficou inacessivel pelo painel por quase 2h.
+	//
+	// Abortar aqui mantem a senha antiga nos DOIS lados — consistente, sem lockout.
+	// Leitura duvidosa (SCM falhando) cai no mesmo ramo de proposito: na duvida, NAO
+	// rotaciona. O custo e uma senha que sobrevive mais um ciclo; o custo do contrario
+	// e a maquina inacessivel.
+	if !clienteVivo() {
+		logln("ROTATE ABORT: servico do cliente parado — senha antiga mantida nos dois lados")
 		return
 	}
 
@@ -229,13 +280,36 @@ func rotateOnBoot() {
 	if holdActive() {
 		return
 	}
+	// ESPERA o cliente subir antes de rotacionar. Agente e cliente sao servicos
+	// independentes e no boot sobem em paralelo: sem esta espera o agente ganhava a
+	// corrida, aplicava a senha sem ninguem para receber e o painel ficava servindo
+	// uma senha que a maquina nunca teve (ver o GATE em rotateNow).
+	if !esperaCliente(esperaClienteLimite) {
+		logln("ROTATE boot: cliente nao subiu em %s — rotacao adiada (o restart do cliente re-sincroniza)", esperaClienteLimite)
+		return
+	}
 	logln("ROTATE boot: rotacionando senha no startup (fecha 'senha sobrevive ao reboot')")
+	rotateNow()
+}
+
+// rotateAposRestartDoCliente re-sincroniza a senha quando o servico do cliente
+// REINICIA (detectClientRestart, em main.go). Ao subir, o cliente recarrega a config
+// do disco: a senha que ele passa a exigir e a que estava gravada la, que pode nao ser
+// a que o painel conhece. Rotacionar aqui — com o cliente comprovadamente de pe — faz
+// os dois lados voltarem a bater sozinhos.
+//
+// E a rede de seguranca do conjunto: mesmo que uma divergencia apareca por um caminho
+// que nao previmos, ela morre no proximo restart do cliente em vez de durar ate alguem
+// perceber e intervir na maquina.
+func rotateAposRestartDoCliente() {
+	logln("ROTATE re-sync: cliente reiniciou e recarregou a config — rotacionando para realinhar com o painel")
 	rotateNow()
 }
 
 // restartClientService (por plataforma) reinicia o servico do cliente branded.
 // Billing B2: e o corte DURO do free — parar o servico derruba a sessao ativa; ao
-// subir, o cliente recarrega a config com a senha JA rotacionada.
+// subir, o cliente recarrega a config com a senha JA rotacionada. No Windows sai pelo
+// SCM; no macOS, por launchctl kickstart.
 
 // flushPending reenvia ao painel a senha pendente (JA aplicada no endpoint).
 // true = nao ha mais pendencia: ou nao havia nada a enviar, ou o painel confirmou.

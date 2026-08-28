@@ -74,11 +74,15 @@ func (t *tailer) checkSessaoViva() {
 
 	logln("<<< %d conexao(oes) presa(s) sem socket de sessao ha %s — SESSAO ENCERRADA (fantasma)",
 		len(t.open), semSocketJanela)
+	// Antes de esvaziar t.open: este fim nao passa pelo "closed", entao e aqui que uma
+	// conexao presa ha mais que o limiar se declara sessao de verdade. Chegar ate aqui
+	// ja exige semSocketJanela (5 min) de #N aberto, entao na pratica sempre marca.
+	t.autenticaPorTempo()
 	t.semSocketDesde = time.Time{}
 	t.open = make(map[string]time.Time)
 	t.graceUntil = time.Time{}
 	t.hardCapUntil = time.Time{}
 	t.controllerID = ""
 	postEvent("end", "")
-	go rotateNow()
+	t.rotacionarSeAutenticada("fantasma")
 }
