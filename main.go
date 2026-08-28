@@ -53,7 +53,22 @@ const (
 	ingestURL         = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/session-ingest"
 	pollInterval      = 3 * time.Second
 	heartbeatInterval = 20 * time.Second
-	presenceInterval  = 60 * time.Second
+
+	// presenceInterval — batimento da maquina OCIOSA, e a maior fonte de invocacao
+	// do projeto inteiro. Medido em 26/08/2026: a session-ingest fez 130.402
+	// chamadas em 24h (49% de tudo), praticamente todas 'presence' de ~105 maquinas
+	// ligadas. A 60s cada maquina custava 1.440/dia; a 180s custa 480.
+	//
+	// Nao mexemos no heartbeatInterval de proposito: ele so bate DURANTE sessao, e
+	// sessao e evento raro (~450/mes). O custo esta na maquina parada, nao na ocupada.
+	//
+	// ACOPLAMENTO (nao afrouxar sem ler): o painel deriva online/offline de
+	// address_book.last_online, carimbado justamente por este evento. Se a janela do
+	// painel for menor que esta cadencia, a frota inteira pisca offline. A janela
+	// vive em src/lib/presenca.ts (JANELA_ONLINE_MS) do repo do painel, hoje em 7min,
+	// e PRECISA estar publicada antes deste agente sair. Alargar a janela e
+	// compativel com agente antigo; encurtar depois nao e.
+	presenceInterval = 180 * time.Second
 
 	// Fase 3 §3.1 — janela de carencia (debounce) do fim de sessao. Ao esvaziar o
 	// conjunto de #N, NAO encerra/rotaciona na hora: espera este prazo por uma
@@ -131,6 +146,55 @@ func readTrim(path string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// revalidaRustdeskID — o CLIENTE e a autoridade sobre o proprio ID; o arquivo em
+// ProgramData e cache do instalador, e cache fica velho.
+//
+// O BUG QUE ISTO FECHA (medido em 26-28/08/2026): reinstalar o cliente sorteia um ID
+// NOVO, mas ninguem reescreve o cache em ProgramData — e o bootstrap.ps1
+// nao toca nesse diretorio de proposito, pra nao rematricular. Como discoverRustdeskID()
+// devolve o arquivo ANTES de perguntar ao cliente, e waitForRustDeskID() chama
+// discoverRustdeskID() primeiro, o agente passa a viver sob um ID MORTO: a session-ingest
+// responde 404, a matricula abre claim atras de claim sob um ID que nenhum humano
+// consegue casar com maquina nenhuma, e nasce um zumbi que polla claim-status a cada 15s
+// pra sempre. Rejeitar ou expirar a claim nao adianta — o agente re-registra. Resultado
+// medido: 5.910 claims expiradas e claim-status em 122.764 invocacoes/dia, 46% de tudo.
+//
+// Regra: se o cliente responder um ID valido e DIFERENTE do arquivo, o cliente vence.
+// Reescreve o cache e descarta o token — ele foi emitido pro device antigo e nao vale
+// nada sob o ID novo. O proximo passo do worker cai em MODO MATRICULA e se matricula
+// sob o ID certo, que ai e adotavel.
+//
+// Fail-safe em toda saida: cliente ausente, --get-id falhando ou ID igual => NAO mexe em
+// nada. Identidade so troca com resposta positiva e bem formada do cliente (getRustDeskID
+// ja valida o formato e tenta por ate 90s). Na duvida, mantem o que esta.
+//
+// Roda UMA vez, no startup, antes de ler o token — nao dentro do laco de matricula, pra
+// nao pagar um exec a cada 15s.
+func revalidaRustdeskID() {
+	guardado := readTrim(ridFile)
+	if guardado == "" {
+		return // sem cache: o fluxo normal ja pergunta ao cliente
+	}
+	exe, err := findRustDeskExe()
+	if err != nil {
+		return // cliente nao instalado: nao ha a quem perguntar
+	}
+	atual, err := getRustDeskID(exe)
+	if err != nil || atual == "" || atual == guardado {
+		return
+	}
+	logln("ID DIVERGENTE: arquivo=%s, cliente=%s -> o cliente vence (cliente reinstalado)", guardado, atual)
+	if err := os.WriteFile(ridFile, []byte(atual), 0o600); err != nil {
+		logln("ID: falha ao regravar %s: %v -- mantendo %s", ridFile, err, guardado)
+		return
+	}
+	_ = hardenDir(baseDir)
+	if readTrim(tokenFile) != "" {
+		_ = os.Remove(tokenFile)
+		logln("ID: token descartado (era do device %s) -> rematricula sob %s", guardado, atual)
+	}
 }
 
 // Descobre o rustdesk_id: arquivo dedicado (autoridade do instalador) ou, fallback,
@@ -761,6 +825,9 @@ func (t *tailer) poll() {
 
 func worker(stop <-chan struct{}) {
 	logln("===== AcessoFast agent iniciado =====")
+	// ANTES de ler o token: se o cliente foi reinstalado, o ID mudou e o token velho
+	// nao vale mais. Ver revalidaRustdeskID.
+	revalidaRustdeskID()
 	token = readTrim(tokenFile)
 	if token == "" {
 		logln("sem token em %s -> MODO MATRICULA (tailer ativo p/ auto-adocao)", tokenFile)
