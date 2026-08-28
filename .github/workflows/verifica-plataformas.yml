@@ -75,20 +75,49 @@ jobs:
       # Nativo, e por isso a matriz existe: aqui rodam tambem os testes com build tag
       # deste sistema — no Windows, a trava dos caminhos em C:\ProgramData; no macOS,
       # a de /Library/Application Support e a do rotulo do LaunchDaemon.
+      # O eco em ::error:: NAO e enfeite de log. O log completo de uma execucao so se
+      # baixa autenticado; ANOTACAO, nao — ela sai na API publica do repo. Sem isto,
+      # diagnosticar uma quebra que so acontece num dos dois sistemas depende de
+      # alguem abrir o navegador e transcrever o erro. Com isto, a mensagem que
+      # importa viaja junto com o resultado.
+      #
+      # O filtro escolhe as linhas que dizem ALGO (FAIL, erro de compilacao, panic) e
+      # corta em 10: o GitHub descarta anotacao alem disso, e despejar o -v inteiro
+      # gastaria o limite com linhas de teste que passaram.
       - name: Testes (nativos deste sistema)
         shell: bash
-        run: go test ./... -v
+        run: |
+          set +e
+          saida="$(go test ./... -v 2>&1)"
+          rc=$?
+          echo "$saida"
+          if [ $rc -ne 0 ]; then
+            echo "$saida" \
+              | grep -aE "FAIL|panic:|cannot|undefined|no required module|build constraints|Error|error:" \
+              | tail -10 \
+              | while IFS= read -r linha; do echo "::error::teste: ${linha}"; done
+          fi
+          exit $rc
 
       # Prova que o binario deste sistema realmente sai. O vet compila os pacotes; o
       # build produz o executavel de verdade, com o linker no meio.
       - name: Binario deste sistema
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           if [ "$RUNNER_OS" = "Windows" ]; then
-            CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o agente-verificacao.exe .
-            ls -la agente-verificacao.exe
+            saida="$(CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o agente-verificacao.exe . 2>&1)"
+            rc=$?
+            alvo=agente-verificacao.exe
           else
-            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o agente-verificacao .
-            ls -la agente-verificacao
+            saida="$(CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o agente-verificacao . 2>&1)"
+            rc=$?
+            alvo=agente-verificacao
           fi
+          echo "$saida"
+          if [ $rc -ne 0 ]; then
+            echo "$saida" | tail -10 \
+              | while IFS= read -r linha; do echo "::error::build: ${linha}"; done
+            exit $rc
+          fi
+          ls -la "$alvo"
