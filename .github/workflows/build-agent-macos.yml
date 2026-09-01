@@ -46,6 +46,23 @@ jobs:
   build:
     name: Universal (arm64 + Intel)
     runs-on: macos-latest
+
+    # CGO DESLIGADO NO JOB INTEIRO, e nao so nos passos de build.
+    #
+    # Com cgo ligado (o padrao do `go test` nativo no macOS) a linkagem passa pelo
+    # linker da Apple, que produz um binario de teste sem LC_UUID — e o dyld recusa
+    # carregar: "missing LC_UUID load command", abort trap em 0.002s, antes de rodar
+    # teste nenhum.
+    #
+    # Alem de consertar, isto ALINHA o teste ao produto: o agente e entregue com
+    # CGO_ENABLED=0 nas duas plataformas, entao testar com cgo ligado seria exercitar
+    # uma configuracao que nunca sai daqui.
+    #
+    # No nivel do JOB de proposito: este mesmo defeito ja tinha sido corrigido no
+    # verifica-plataformas.yml e voltou aqui, porque la a correcao foi por passo.
+    env:
+      CGO_ENABLED: "0"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
