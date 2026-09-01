@@ -324,44 +324,58 @@ jobs:
           echo "depois do patch:"; grep -n "Products/Release/.*\.app" build.py
 
       # O ICONE. Sem este passo o app sai com o icone do RustDesk — foi o que
-      # aconteceu num instalador anterior, e e o tipo de erro que ninguem percebe no
-      # log e todo cliente percebe na tela.
+      # aconteceu no primeiro .dmg, e e o tipo de erro que ninguem ve no log e todo
+      # cliente ve na tela.
       #
-      # No macOS o icone nao vem de res/icon.png, e sim de res/mac-icon.png: o
-      # flutter_launcher_icons le esse caminho especifico (flutter/pubspec.yaml,
-      # secao flutter_icons > macos) e gera o AppIcon.appiconset a partir dele.
+      # O projeto macOS do RustDesk NAO usa Assets.xcassets: o Info.plist declara
+      # CFBundleIconFile = AppIcon.icns e o arquivo mora em flutter/macos/Runner/.
+      # Entao nao adianta rodar o flutter_launcher_icons (que geraria um appiconset
+      # que ninguem le) — o que vale e substituir o .icns.
       #
-      # O passo equivalente no build Windows e continue-on-error. Aqui NAO e, e ainda
-      # confere o resultado: comparar o hash do appiconset antes e depois e a unica
-      # forma de saber que a geracao realmente aconteceu. Falhar calado aqui entrega
-      # um produto com a marca de outro.
+      # O .icns e um pacote com varios tamanhos. O caminho canonico da Apple e montar
+      # um diretorio .iconset com os PNGs nomeados pela convencao e converter com o
+      # iconutil; sips e iconutil ja vem no macOS, sem instalar nada.
       - name: Marca — icone do aplicativo
         shell: bash
         run: |
           set -euo pipefail
-          largura="$(sips -g pixelWidth "$AF_BRANDING/icon.png" | awk '/pixelWidth/{print $2}')"
-          echo "::notice::icone de origem: ${largura}px"
-          if [ "${largura:-0}" -lt 512 ]; then
-            echo "::warning::branding/icon.png tem ${largura}px. O macOS usa o icone ate 1024px; abaixo disso ele sai borrado no Dock e no Finder. Vale trocar por uma arte de 1024x1024."
+          origem="$AF_BRANDING/icon.png"
+          largura="$(sips -g pixelWidth "$origem" | awk '/pixelWidth/{print $2}')"
+          echo "::notice::arte de origem: ${largura}px"
+          if [ "${largura:-0}" -lt 1024 ]; then
+            echo "::warning::a arte tem ${largura}px e o macOS usa ate 1024 no Dock e no Finder — o sistema vai AMPLIAR, e o icone sai borrado nos tamanhos grandes."
           fi
 
-          cp "$AF_BRANDING/icon.png" ./res/icon.png
-          cp "$AF_BRANDING/icon.png" ./res/mac-icon.png
-
-          conjunto=./flutter/macos/Runner/Assets.xcassets/AppIcon.appiconset
-          antes="$(find "$conjunto" -name '*.png' -exec shasum {} \; | shasum | cut -d' ' -f1)"
-
-          pushd ./flutter >/dev/null
-          flutter pub get
-          flutter pub run flutter_launcher_icons
-          popd >/dev/null
-
-          depois="$(find "$conjunto" -name '*.png' -exec shasum {} \; | shasum | cut -d' ' -f1)"
-          if [ "$antes" = "$depois" ]; then
-            echo "::error::o AppIcon.appiconset nao mudou — a geracao de icones nao pegou, e o app sairia com o icone do RustDesk."
+          alvo=./flutter/macos/Runner/AppIcon.icns
+          if [ ! -f "$alvo" ]; then
+            echo "::error::$alvo nao existe — o RustDesk mudou onde guarda o icone do macOS. Revisar antes de publicar."
             exit 1
           fi
-          echo "::notice::icones do app regerados a partir da nossa arte"
+          antes="$(shasum "$alvo" | cut -d" " -f1)"
+
+          # Os nomes NAO sao livres: o iconutil so aceita a convencao da Apple
+          # (icon_<lado>x<lado>[@2x].png), e um nome fora dela e ignorado em silencio.
+          conjunto="$RUNNER_TEMP/AcessoFast.iconset"
+          rm -rf "$conjunto"; mkdir -p "$conjunto"
+          for par in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" \
+                     "128 128x128" "256 128x128@2x" "256 256x256" "512 256x256@2x" \
+                     "512 512x512" "1024 512x512@2x"; do
+            px="${par%% *}"
+            nome="${par##* }"
+            sips -z "$px" "$px" "$origem" --out "$conjunto/icon_${nome}.png" >/dev/null
+          done
+          iconutil -c icns "$conjunto" -o "$alvo"
+
+          depois="$(shasum "$alvo" | cut -d" " -f1)"
+          if [ "$antes" = "$depois" ]; then
+            echo "::error::o AppIcon.icns nao mudou — o app sairia com o icone do RustDesk."
+            exit 1
+          fi
+          echo "::notice::AppIcon.icns regerado a partir da nossa arte"
+
+          # O icone da bandeja e do lado Rust, e sai de res/icon.png.
+          cp "$origem" ./res/icon.png
+          cp "$origem" ./res/mac-icon.png
 
       - name: Relay e chave (o cliente nao conecta em mais lugar nenhum)
         shell: bash
