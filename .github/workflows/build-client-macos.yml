@@ -196,7 +196,9 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Install build runtime
         run: |
-          brew install llvm create-dmg
+          # imagemagick e usado pra brandar a imagem da interface, exatamente como no
+          # build Windows. Nao vem no runner.
+          brew install llvm create-dmg imagemagick
           if ! command -v pkg-config &>/dev/null; then brew install pkg-config; fi
 
       - name: Install NASM
@@ -474,24 +476,36 @@ jobs:
           echo -n "${{ env.custom }}" > "$app/Contents/MacOS/custom_.txt"
           echo "APP_BUNDLE=$app" >> "$GITHUB_ENV"
 
-      # O LOGO que aparece DENTRO do app (barra lateral). Mesmo alvo do build
-      # Windows, que copia por cima de flutter_assets/assets/logo.png — no macOS esse
-      # caminho vive dentro do bundle, sob App.framework.
+      # A IMAGEM QUE APARECE DENTRO DO APP (barra lateral).
       #
-      # Tem que ser aqui: depois do build (o arquivo so existe apos ele) e ANTES da
-      # assinatura, porque assinar sela o conteudo do bundle e qualquer troca
-      # posterior invalidaria a assinatura.
-      - name: Marca — logo dentro do aplicativo
+      # O alvo NAO e um logo.png: essa versao do RustDesk nem tem esse arquivo. Quem
+      # desenha a marca na interface e assets/icon.svg, e o build Windows o substitui
+      # pelo nosso PNG convertido (passo "icon stuff"). Fazemos o mesmo aqui — mesma
+      # ferramenta, mesmo comando, mesmo resultado da versao que ja esta em producao.
+      #
+      # (O passo equivalente do Windows para logo.png escreve um arquivo que ninguem
+      # le, resquicio do rdgen. La passa despercebido porque e continue-on-error.)
+      #
+      # Tem que ser aqui: depois do build, porque o arquivo so existe apos ele, e
+      # ANTES da assinatura, porque assinar sela o bundle e trocar arquivo depois
+      # invalidaria a assinatura.
+      - name: Marca — imagem dentro do aplicativo
         shell: bash
         run: |
           set -euo pipefail
-          destino="$APP_BUNDLE/Contents/Frameworks/App.framework/Resources/flutter_assets/assets/logo.png"
+          destino="$APP_BUNDLE/Contents/Frameworks/App.framework/Resources/flutter_assets/assets/icon.svg"
           if [ ! -f "$destino" ]; then
-            echo "::error::nao achei $destino — o RustDesk mudou onde guarda o logo; revisar antes de publicar."
+            echo "::error::nao achei $destino — o RustDesk mudou onde guarda a marca da interface; revisar antes de publicar."
             exit 1
           fi
-          cp "$AF_BRANDING/logo.png" "$destino"
-          echo "::notice::logo da interface substituido pelo nosso"
+          antes="$(shasum "$destino" | cut -d" " -f1)"
+          magick ./res/icon.png "$destino"
+          depois="$(shasum "$destino" | cut -d" " -f1)"
+          if [ "$antes" = "$depois" ]; then
+            echo "::error::o icon.svg nao mudou — a interface sairia com a marca do RustDesk."
+            exit 1
+          fi
+          echo "::notice::marca da interface substituida"
 
       # SEM ESTE PASSO O APP NAO ABRE. Provado em Mac real (27/08):
       #
