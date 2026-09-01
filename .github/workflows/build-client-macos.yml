@@ -323,6 +323,46 @@ jobs:
           sed -i "" -e "s|Release/RustDesk.app/Contents/MacOS/|Release/${{ env.appname }}.app/Contents/MacOS/|g" build.py
           echo "depois do patch:"; grep -n "Products/Release/.*\.app" build.py
 
+      # O ICONE. Sem este passo o app sai com o icone do RustDesk — foi o que
+      # aconteceu num instalador anterior, e e o tipo de erro que ninguem percebe no
+      # log e todo cliente percebe na tela.
+      #
+      # No macOS o icone nao vem de res/icon.png, e sim de res/mac-icon.png: o
+      # flutter_launcher_icons le esse caminho especifico (flutter/pubspec.yaml,
+      # secao flutter_icons > macos) e gera o AppIcon.appiconset a partir dele.
+      #
+      # O passo equivalente no build Windows e continue-on-error. Aqui NAO e, e ainda
+      # confere o resultado: comparar o hash do appiconset antes e depois e a unica
+      # forma de saber que a geracao realmente aconteceu. Falhar calado aqui entrega
+      # um produto com a marca de outro.
+      - name: Marca — icone do aplicativo
+        shell: bash
+        run: |
+          set -euo pipefail
+          largura="$(sips -g pixelWidth "$AF_BRANDING/icon.png" | awk '/pixelWidth/{print $2}')"
+          echo "::notice::icone de origem: ${largura}px"
+          if [ "${largura:-0}" -lt 512 ]; then
+            echo "::warning::branding/icon.png tem ${largura}px. O macOS usa o icone ate 1024px; abaixo disso ele sai borrado no Dock e no Finder. Vale trocar por uma arte de 1024x1024."
+          fi
+
+          cp "$AF_BRANDING/icon.png" ./res/icon.png
+          cp "$AF_BRANDING/icon.png" ./res/mac-icon.png
+
+          conjunto=./flutter/macos/Runner/Assets.xcassets/AppIcon.appiconset
+          antes="$(find "$conjunto" -name '*.png' -exec shasum {} \; | shasum | cut -d' ' -f1)"
+
+          pushd ./flutter >/dev/null
+          flutter pub get
+          flutter pub run flutter_launcher_icons
+          popd >/dev/null
+
+          depois="$(find "$conjunto" -name '*.png' -exec shasum {} \; | shasum | cut -d' ' -f1)"
+          if [ "$antes" = "$depois" ]; then
+            echo "::error::o AppIcon.appiconset nao mudou — a geracao de icones nao pegou, e o app sairia com o icone do RustDesk."
+            exit 1
+          fi
+          echo "::notice::icones do app regerados a partir da nossa arte"
+
       - name: Relay e chave (o cliente nao conecta em mais lugar nenhum)
         shell: bash
         run: |
@@ -419,6 +459,25 @@ jobs:
           echo "bundle: $app"
           echo -n "${{ env.custom }}" > "$app/Contents/MacOS/custom_.txt"
           echo "APP_BUNDLE=$app" >> "$GITHUB_ENV"
+
+      # O LOGO que aparece DENTRO do app (barra lateral). Mesmo alvo do build
+      # Windows, que copia por cima de flutter_assets/assets/logo.png — no macOS esse
+      # caminho vive dentro do bundle, sob App.framework.
+      #
+      # Tem que ser aqui: depois do build (o arquivo so existe apos ele) e ANTES da
+      # assinatura, porque assinar sela o conteudo do bundle e qualquer troca
+      # posterior invalidaria a assinatura.
+      - name: Marca — logo dentro do aplicativo
+        shell: bash
+        run: |
+          set -euo pipefail
+          destino="$APP_BUNDLE/Contents/Frameworks/App.framework/Resources/flutter_assets/assets/logo.png"
+          if [ ! -f "$destino" ]; then
+            echo "::error::nao achei $destino — o RustDesk mudou onde guarda o logo; revisar antes de publicar."
+            exit 1
+          fi
+          cp "$AF_BRANDING/logo.png" "$destino"
+          echo "::notice::logo da interface substituido pelo nosso"
 
       # SEM ESTE PASSO O APP NAO ABRE. Provado em Mac real (27/08):
       #
