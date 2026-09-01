@@ -124,7 +124,10 @@ jobs:
           cp installer/macos/com.carriez.AcessoFast_server.plist  root/Library/LaunchAgents/
 
           mkdir -p scripts
-          cp installer/macos/postinstall scripts/postinstall
+          # Quebra de linha do Windows no shebang vira "bad interpreter": o .pkg
+          # instalaria os arquivos e NENHUM servico subiria, sem erro visivel para
+          # quem instalou. O tr resolve e nao custa nada.
+          tr -d "\r" < installer/macos/postinstall > scripts/postinstall
           chmod +x scripts/postinstall
 
           echo "--- arvore que sera instalada:"
