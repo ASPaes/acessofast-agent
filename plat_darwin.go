@@ -86,6 +86,14 @@ const baseDir = "/Library/Application Support/AcessoFast"
 // exeSuffix: no macOS o executavel nao tem extensao.
 const exeSuffix = ""
 
+// formatosAceitos: o que o auto-update pode instalar aqui. O universal e o formato
+// que o nosso build produz (arm64 + Intel no mesmo arquivo); o Mach-O simples entra
+// porque um release futuro pode vir de uma arquitetura so.
+//
+// Isto NAO e teoria: em 01/09/2026 o servidor ofereceu a este agente o .exe do
+// Windows, e ele instalou. Ver formato_binario.go.
+var formatosAceitos = []string{formatoUniversal, formatoMachO}
+
 // agentLaunchdLabel: rotulo do LaunchDaemon do AGENTE. O .plist instalado pelo .pkg
 // usa este mesmo rotulo; se os dois divergirem, o auto-update troca o binario e
 // nunca consegue reiniciar o servico.

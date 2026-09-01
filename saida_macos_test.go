@@ -228,3 +228,33 @@ func TestParseLstartComSaidaRealDeCampo(t *testing.T) {
 		t.Error("aceitou a saida em portugues; o agente depende do LC_ALL=C")
 	}
 }
+
+// A COLETA DE 01/09 COM O .pkg INSTALADO mostrou o que a anterior nao podia mostrar:
+// iniciado pelo launchd, o servidor roda com --server. A primeira versao desta funcao
+// exigia AUSENCIA de argumento e nao o enxergava — o agente dava "servico fora do ar"
+// e a autocura reiniciava, de 5 em 5 minutos, um cliente que estava vivo.
+func TestPidDoServidorComOClienteInstaladoComoServico(t *testing.T) {
+	const exe = "/Applications/AcessoFast.app/Contents/MacOS/AcessoFast"
+
+	// Saida real da maquina: o servidor na sessao do usuario, e o helper root, que
+	// tem outro caminho de executavel e por isso nem entra na conta.
+	saida := "  45382 " + exe + " --server\n" +
+		"  45384 /Applications/AcessoFast.app/Contents/MacOS/service\n"
+	got, ok := pidDoServidor(saida, exe)
+	if !ok || got != 45382 {
+		t.Errorf("pidDoServidor = %d (ok=%v), esperava 45382", got, ok)
+	}
+
+	// Com os dois presentes, o --server vence o sem-argumento: quando ele existe, e
+	// ele quem segura a sessao.
+	ambos := "  100 " + exe + "\n  200 " + exe + " --server\n  300 " + exe + " --cm\n"
+	got, ok = pidDoServidor(ambos, exe)
+	if !ok || got != 200 {
+		t.Errorf("pidDoServidor = %d (ok=%v), esperava 200 (--server)", got, ok)
+	}
+
+	// So o --cm rodando nao e servidor nenhum.
+	if _, ok := pidDoServidor("  300 "+exe+" --cm\n", exe); ok {
+		t.Error("--cm sozinho nao pode ser tomado por servidor")
+	}
+}

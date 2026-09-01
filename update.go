@@ -266,6 +266,25 @@ func motivoPular(u *updateInfo, versaoAtual, jaAplicado string, tentativas int) 
 	return ""
 }
 
+// confereFormatoDoBinario recusa um arquivo que nao roda nesta plataforma. Le apenas
+// o cabecalho: o bastante pra distinguir um executavel do Windows de um do macOS.
+// Nao e papel daqui julgar se o binario e bom — so se ele e DAQUI.
+func confereFormatoDoBinario(caminho string) error {
+	f, err := os.Open(caminho)
+	if err != nil {
+		return fmt.Errorf("abrir o binario baixado: %w", err)
+	}
+	defer f.Close()
+
+	var cabecalho [8]byte
+	n, _ := io.ReadFull(f, cabecalho[:])
+	formato := formatoDoBinario(cabecalho[:n])
+	if !formatoAceitoAqui(formato) {
+		return fmt.Errorf("o binario baixado e %q e nao roda nesta plataforma", formato)
+	}
+	return nil
+}
+
 // aplicaUpdate roda o fluxo inteiro. Chamado SO no ramo de 'presence' do worker —
 // ou seja, com a maquina comprovadamente ociosa. Nunca no meio de um atendimento.
 func aplicaUpdate(u *updateInfo) {
@@ -293,6 +312,16 @@ func aplicaUpdate(u *updateInfo) {
 	if err != nil {
 		logln("update %s falhou no download/hash: %v (tentativa %d/%d)",
 			u.Version, err, updateTries[u.Version], updateMaxTries)
+		return
+	}
+
+	// ASSINATURA E HASH PROVAM PROCEDENCIA, NAO APLICABILIDADE. Em 01/09/2026 o
+	// servidor ofereceu a um agente macOS o binario do WINDOWS: os dois testes acima
+	// PASSARAM (o arquivo e legitimo, so e de outro sistema), o agente trocou o
+	// proprio binario e morreu no restart seguinte, porque o launchd nao executa um
+	// PE. Faltava perguntar se o arquivo sequer roda AQUI.
+	if err := confereFormatoDoBinario(verificado); err != nil {
+		logln("update %s RECUSADO: %v", u.Version, err)
 		return
 	}
 

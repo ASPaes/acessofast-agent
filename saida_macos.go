@@ -110,22 +110,58 @@ func parseLstart(saida string, loc *time.Location) (time.Time, bool) {
 // processo errado daria "sem socket" com sessao viva — e o agente encerraria a
 // sessao de quem esta trabalhando, achando que era fantasma.
 //
-// O criterio e a AUSENCIA de argumento: o servidor roda com o caminho do executavel
-// e nada mais. Escolher pelo menor PID funcionaria hoje (o --cm nasce depois, com PID
-// maior), mas por coincidencia, nao por regra.
+// O ARGUMENTO DEPENDE DE COMO O CLIENTE FOI INICIADO, e isso me pegou:
+//
+//	instalado como servico   AcessoFast --server     <- launchd, o caso do cliente
+//	aberto a mao pela pessoa AcessoFast              <- sem argumento
+//
+// A primeira versao desta funcao exigia AUSENCIA de argumento, porque na coleta de
+// campo o app tinha sido aberto a mao. Com o .pkg instalado, o servidor passou a
+// rodar com --server e o agente parou de enxergar o cliente: dava "servico fora do
+// ar" e a autocura reiniciava um cliente que estava perfeitamente vivo, de 5 em 5
+// minutos, pra sempre.
+//
+// A regra correta e por EXCLUSAO: o que nunca serve e o --cm (gerenciador de
+// conexoes, sem socket). Entre os demais, o --server tem preferencia — quando ele
+// existe, e ele quem segura a sessao.
 func pidDoServidor(saidaPs, exe string) (uint32, bool) {
+	var comServer, semArgumento uint32
 	for _, linha := range strings.Split(saidaPs, "\n") {
 		campos := strings.Fields(linha)
-		// Exatamente dois campos: o pid e o caminho. Tres ou mais significa que ha
-		// argumento (--cm e o que se ve hoje), e ai nao e o servidor.
-		if len(campos) != 2 || campos[1] != exe {
+		if len(campos) < 2 || campos[1] != exe {
 			continue
 		}
-		pid, err := strconv.ParseUint(campos[0], 10, 32)
-		if err != nil || pid == 0 {
+		pid64, err := strconv.ParseUint(campos[0], 10, 32)
+		if err != nil || pid64 == 0 {
 			continue
 		}
-		return uint32(pid), true
+		pid := uint32(pid64)
+		argumentos := campos[2:]
+		if temArgumento(argumentos, "--cm") {
+			continue
+		}
+		if temArgumento(argumentos, "--server") {
+			comServer = pid
+			continue
+		}
+		if len(argumentos) == 0 {
+			semArgumento = pid
+		}
+	}
+	if comServer != 0 {
+		return comServer, true
+	}
+	if semArgumento != 0 {
+		return semArgumento, true
 	}
 	return 0, false
+}
+
+func temArgumento(argumentos []string, alvo string) bool {
+	for _, a := range argumentos {
+		if a == alvo {
+			return true
+		}
+	}
+	return false
 }

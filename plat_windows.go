@@ -37,6 +37,10 @@ const baseDir = `C:\ProgramData\AcessoFast`
 // exeSuffix: extensao do executavel neste SO. Usada pelo update ao nomear o download.
 const exeSuffix = ".exe"
 
+// formatosAceitos: o que o auto-update pode instalar aqui. Ver formato_binario.go —
+// existe porque um agente ja recebeu o binario da plataforma errada.
+var formatosAceitos = []string{formatoPE}
+
 // clientServiceName: o servico Windows do cliente branded (o RustDesk server que
 // RECEBE as conexoes). Distinto do agente (serviceName = "AcessoFastAgent").
 const clientServiceName = "AcessoFast"
