@@ -25,6 +25,10 @@ run-name: "AcessoFast Agent macOS — ${{ github.sha }}"
 
 on:
   workflow_dispatch:
+  # Chamado pelo build-installer-macos.yml: o instalador leva o binario produzido
+  # AQUI, e nao um compilado por conta propria. Um instalador que compila o seu
+  # proprio agente entrega uma coisa e o auto-update entrega outra.
+  workflow_call:
   push:
     branches: [main, master]
     paths:

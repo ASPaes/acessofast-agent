@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AcessoFast — LaunchDaemon do AGENTE.
+
+  Equivale ao servico SCM rodando como SYSTEM no Windows: sobe no boot, antes de
+  qualquer login, e volta sozinho se cair.
+
+  O Label e CONTRATO COM O CODIGO: plat_darwin.go usa este mesmo texto em
+  agentLaunchdLabel para reiniciar o agente depois de uma troca de binario pelo
+  auto-update. Se divergirem, o update troca o binario e nunca consegue reiniciar —
+  a maquina fica na versao velha, sem erro visivel. Ha um teste (plat_darwin_test.go)
+  fixando o valor justamente por isso.
+
+  KeepAlive nao e opcional: e nele que o auto-update se apoia. O agente troca o
+  proprio binario e agenda um kickstart; quem garante que o processo volta e o
+  launchd.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>br.com.acessofast.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/AcessoFast/acessofast-agent</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Agente que morre no boot (disco lento, dependencia ausente) nao pode virar
+         laco de reinicio. 10s entre tentativas basta e nao esquenta a maquina. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Library/Application Support/AcessoFast/agent.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Application Support/AcessoFast/agent.stderr.log</string>
+</dict>
+</plist>

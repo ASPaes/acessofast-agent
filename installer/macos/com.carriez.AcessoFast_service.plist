@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AcessoFast — LaunchDaemon do CLIENTE (parte root).
+
+  Copia fiel do modelo do RustDesk (src/platform/privileges_scripts/daemon.plist),
+  com os nomes ja substituidos: RustDesk -> AcessoFast no Label e nos caminhos, e o
+  AssociatedBundleIdentifiers apontando para o NOSSO bundle.
+
+  POR QUE INSTALAMOS ISTO NOS, em vez de deixar o app instalar sozinho: o fluxo do
+  proprio RustDesk abre uma janela do sistema pedindo senha de administrador. Num
+  instalador que ja roda como root isso e desnecessario — e num deploy em massa seria
+  impeditivo, porque nao ha ninguem na frente da maquina para digitar.
+
+  O NOME NAO E ESCOLHA NOSSA: o cliente monta este Label como {ORG}.{APP_NAME}_service
+  e verifica a existencia do arquivo por esse nome (is_installed_daemon, em
+  src/platform/macos.rs). Renomear faria o proprio cliente achar que o servico nao
+  esta instalado.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.carriez.AcessoFast_service</string>
+
+    <key>AssociatedBundleIdentifiers</key>
+    <string>br.com.acessofast.client</string>
+
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>1</integer>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>/Applications/AcessoFast.app/Contents/MacOS/service</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>/Applications/AcessoFast.app/Contents/MacOS/</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/acessofast_service.err</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/acessofast_service.out</string>
+</dict>
+</plist>

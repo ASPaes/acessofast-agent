@@ -1,0 +1,111 @@
+#!/bin/sh
+# AcessoFast — pos-instalacao do .pkg (macOS).
+#
+# O .pkg ja copiou os arquivos. Aqui a gente ajusta dono/permissao e SOBE os
+# servicos, para a maquina ficar utilizavel sem reiniciar e sem ninguem clicar em
+# mais nada.
+#
+# Tudo roda como root, que e o ponto: o fluxo do proprio RustDesk para instalar o
+# servico abre uma janela pedindo senha de administrador. Aqui isso nao existe — o
+# que tambem e o que torna possivel deploy em massa, sem ninguem na frente da maquina.
+#
+# A saida deste script vai para /var/log/install.log, junto com o resto da instalacao.
+#
+# ATENCAO: este script PRECISA terminar com exit 0. Qualquer codigo diferente faz o
+# Instalador do macOS declarar a instalacao como falha para o usuario, mesmo com tudo
+# no lugar. Por isso os passos tolerantes usam "|| true" e o final e explicito.
+
+set -u
+
+BASE="/Library/Application Support/AcessoFast"
+AGENTE="$BASE/acessofast-agent"
+
+echo "AcessoFast: pos-instalacao iniciada"
+
+# ---------------------------------------------------------------------------
+# 1. Diretorio de dados do agente
+# ---------------------------------------------------------------------------
+# 0700 e root nao e exagero: e aqui que ficam o agent.token e a senha pendente. O
+# token e uma CREDENCIAL — quem o le forja eventos de sessao daquela maquina e
+# corrompe o faturamento. /Library/Application Support e legivel por qualquer usuario
+# por padrao, entao trancar e obrigatorio. Mesmo motivo do icacls no Windows.
+mkdir -p "$BASE"
+chown root:wheel "$BASE"
+chmod 700 "$BASE"
+
+if [ -f "$AGENTE" ]; then
+	chown root:wheel "$AGENTE"
+	chmod 755 "$AGENTE"
+else
+	echo "AcessoFast: ERRO — $AGENTE nao foi instalado"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Servicos do sistema (root)
+# ---------------------------------------------------------------------------
+# bootout antes de bootstrap: numa REINSTALACAO o servico ja esta carregado, e
+# bootstrap sobre um label existente falha. Descarregar antes torna o script
+# idempotente — pode rodar quantas vezes for.
+#
+# O fallback para "load -w" cobre macOS antigo, onde bootstrap/bootout nao existem.
+for LABEL in br.com.acessofast.agent com.carriez.AcessoFast_service; do
+	PLIST="/Library/LaunchDaemons/$LABEL.plist"
+	if [ ! -f "$PLIST" ]; then
+		echo "AcessoFast: ERRO — $PLIST ausente"
+		continue
+	fi
+	chown root:wheel "$PLIST"
+	chmod 644 "$PLIST"
+	launchctl bootout "system/$LABEL" 2>/dev/null || true
+	if launchctl bootstrap system "$PLIST" 2>/dev/null; then
+		echo "AcessoFast: $LABEL carregado"
+	elif launchctl load -w "$PLIST" 2>/dev/null; then
+		echo "AcessoFast: $LABEL carregado (load -w)"
+	else
+		echo "AcessoFast: AVISO — nao consegui carregar $LABEL"
+	fi
+done
+
+# ---------------------------------------------------------------------------
+# 3. Servico do cliente na sessao grafica
+# ---------------------------------------------------------------------------
+# E ESTE que recebe as sessoes (confirmado em campo, 01/09). Um LaunchAgent nao vive
+# no dominio "system": ele pertence a sessao do usuario, e o alvo e gui/<uid>.
+#
+# O dono de /dev/console e quem esta na frente da maquina. Se ninguem estiver logado
+# (instalacao remota, maquina na tela de login), nao ha sessao grafica onde carregar —
+# e tudo bem: o launchd sobe o agente sozinho no proximo login, por causa do
+# RunAtLoad do plist.
+AGENT_PLIST="/Library/LaunchAgents/com.carriez.AcessoFast_server.plist"
+if [ -f "$AGENT_PLIST" ]; then
+	chown root:wheel "$AGENT_PLIST"
+	chmod 644 "$AGENT_PLIST"
+	UID_CONSOLE="$(stat -f %u /dev/console 2>/dev/null || echo 0)"
+	if [ "$UID_CONSOLE" != "0" ]; then
+		launchctl bootout "gui/$UID_CONSOLE/com.carriez.AcessoFast_server" 2>/dev/null || true
+		if launchctl bootstrap "gui/$UID_CONSOLE" "$AGENT_PLIST" 2>/dev/null; then
+			echo "AcessoFast: servico do cliente carregado na sessao do uid $UID_CONSOLE"
+		else
+			echo "AcessoFast: AVISO — nao consegui carregar o servico do cliente na sessao grafica"
+		fi
+	else
+		echo "AcessoFast: ninguem logado na interface — o servico do cliente sobe no proximo login"
+	fi
+else
+	echo "AcessoFast: ERRO — $AGENT_PLIST ausente"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. O que NAO fazemos aqui
+# ---------------------------------------------------------------------------
+# Nao ha matricula, nem codigo da empresa. Igual ao instalador generico do Windows:
+# o agente sobe SEM token, entra em modo matricula e espera ser adotado pelo ID que o
+# cliente mostra na tela. Nenhum segredo por maquina, e o mesmo .pkg serve para
+# qualquer cliente.
+#
+# Tambem nao pedimos as permissoes de Gravacao de Tela e Acessibilidade: no macOS
+# elas NAO podem ser concedidas por instalador nenhum. Quem instala precisa liga-las
+# a mao nos Ajustes do Sistema — ou receber um perfil PPPC via MDM.
+
+echo "AcessoFast: pos-instalacao concluida"
+exit 0

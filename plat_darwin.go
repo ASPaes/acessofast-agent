@@ -89,7 +89,7 @@ const exeSuffix = ""
 // agentLaunchdLabel: rotulo do LaunchDaemon do AGENTE. O .plist instalado pelo .pkg
 // usa este mesmo rotulo; se os dois divergirem, o auto-update troca o binario e
 // nunca consegue reiniciar o servico.
-const agentLaunchdLabel = "br.com.acessofast.agent"
+const agentLaunchdLabel = rotuloDaemonAgente
 
 // Rotulos do launchd do CLIENTE branded. Nao sao chute: saem do fonte do RustDesk
 // 1.4.9 (src/platform/macos.rs), que monta os arquivos como

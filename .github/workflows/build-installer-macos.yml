@@ -1,0 +1,208 @@
+name: Build AcessoFast Installer (macOS)
+run-name: "Instalador macOS — ${{ inputs.versao }}"
+
+# Monta o AcessoFast.pkg: o equivalente do AcessoFastSetup.exe para Mac.
+#
+# Junta as mesmas tres pecas do instalador Windows — o SCRIPT (aqui, installer/macos/,
+# versionado), o AGENTE (build-agent-macos.yml, chamado por este workflow) e o CLIENTE
+# branded (artifact do build-client-macos.yml) — e faz o que o Inno Setup faz la:
+# copia os arquivos e deixa os servicos rodando.
+#
+# O QUE MUDA EM RELACAO AO WINDOWS, e por que:
+#
+#   - Nao ha assistente e nao ha pergunta. Igual ao instalador GENERICO do Windows
+#     (fluxo B): sem codigo da empresa, sem --enroll. O agente sobe sem token, entra
+#     em modo matricula e espera ser adotado pelo ID que aparece na tela do cliente.
+#     O mesmo .pkg serve para qualquer cliente.
+#
+#   - O servico do cliente e instalado POR NOS, escrevendo os plists direto. O fluxo
+#     do proprio RustDesk abre uma janela pedindo senha de administrador; num .pkg,
+#     que ja roda como root, isso e desnecessario — e em deploy em massa seria
+#     impeditivo.
+#
+#   - O agente vem do build-agent-macos.yml chamado aqui, e nao compilado neste
+#     workflow. Instalador que compila o proprio agente entrega um binario e o
+#     auto-update entrega outro; mais cedo ou mais tarde eles divergem.
+#
+# ASSINATURA: sem o certificado Developer ID Installer, o .pkg sai NAO assinado e o
+# Gatekeeper recusa na maquina de quem baixa. Serve para nosso teste, nao para
+# cliente. Com o certificado presente, ele e assinado aqui; a notarizacao entra junto
+# quando a conta Apple existir.
+
+on:
+  workflow_dispatch:
+    inputs:
+      versao:
+        description: "Versao do instalador (ex: 1.0.0)"
+        required: true
+        default: "1.0.0"
+        type: string
+      client_run_id:
+        description: "Run id do build-client-macos.yml. Vazio = ultimo bem-sucedido."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read # necessario pro gh run download buscar o artifact do cliente
+
+jobs:
+  # O agente sai daqui — mesmo binario que o auto-update entregaria.
+  agente:
+    uses: ./.github/workflows/build-agent-macos.yml
+
+  montar:
+    name: Montar o .pkg
+    needs: agente
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Os plists sao o contrato com o launchd. XML quebrado so apareceria na maquina
+      # do cliente, como servico que nunca sobe — e sem erro visivel no instalador.
+      - name: Validar os plists
+        run: |
+          set -euo pipefail
+          for f in installer/macos/*.plist; do
+            plutil -lint "$f"
+          done
+
+      - name: Baixar o agente (do job acima)
+        uses: actions/download-artifact@v4
+        with:
+          name: acessofast-agent-macos-universal
+          path: payload-agente
+
+      # O cliente so existe como artifact (30 dias de retencao). Expirou -> rodar o
+      # build-client-macos antes; a mensagem diz isso em vez de deixar o erro cru.
+      - name: Baixar o cliente branded
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN="${{ inputs.client_run_id }}"
+          if [ -z "$RUN" ]; then
+            RUN="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build-client-macos.yml \
+                   --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          fi
+          if [ -z "$RUN" ] || [ "$RUN" = "null" ]; then
+            echo "::error::Nenhum build-client-macos.yml bem-sucedido. Rode o Build AcessoFast Client (macOS) primeiro."
+            exit 1
+          fi
+          echo "::notice::cliente vem do run $RUN"
+          gh run download "$RUN" --repo "$GITHUB_REPOSITORY" --dir cliente
+          dmg="$(find cliente -name '*.dmg' | head -1)"
+          if [ -z "$dmg" ]; then
+            echo "::error::Artifact do run $RUN sem .dmg — pode ter expirado (30 dias). Rode o build do cliente de novo."
+            exit 1
+          fi
+          echo "DMG=$dmg" >> "$GITHUB_ENV"
+
+      # Monta a arvore exatamente como ela vai ficar no disco do cliente. O pkgbuild
+      # copia isto para a raiz, preservando a estrutura.
+      - name: Montar o payload
+        run: |
+          set -euo pipefail
+          mkdir -p root/Applications
+          mkdir -p "root/Library/Application Support/AcessoFast"
+          mkdir -p root/Library/LaunchDaemons root/Library/LaunchAgents
+
+          # O .app vem dentro do .dmg; monta, copia com -R (preservando os links
+          # simbolicos do bundle, que um cp comum destruiria) e desmonta.
+          MNT="$(mktemp -d)"
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT"
+          cp -R "$MNT/AcessoFast.app" root/Applications/
+          hdiutil detach "$MNT"
+
+          cp payload-agente/acessofast-agent "root/Library/Application Support/AcessoFast/acessofast-agent"
+          chmod 755 "root/Library/Application Support/AcessoFast/acessofast-agent"
+
+          cp installer/macos/br.com.acessofast.agent.plist        root/Library/LaunchDaemons/
+          cp installer/macos/com.carriez.AcessoFast_service.plist root/Library/LaunchDaemons/
+          cp installer/macos/com.carriez.AcessoFast_server.plist  root/Library/LaunchAgents/
+
+          mkdir -p scripts
+          cp installer/macos/postinstall scripts/postinstall
+          chmod +x scripts/postinstall
+
+          echo "--- arvore que sera instalada:"
+          find root -maxdepth 4 | sed "s|^root||"
+
+      # Guarda: o .app precisa estar assinado (mesmo que ad-hoc) e coerente, senao o
+      # dyld recusa carregar os frameworks embutidos e o app nao abre — foi o que
+      # aconteceu no teste de 27/08.
+      - name: Conferir a assinatura do cliente
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --verbose=2 root/Applications/AcessoFast.app 2>&1 | tail -3
+          echo "::notice::$(codesign -dv root/Applications/AcessoFast.app 2>&1 | grep -i 'Identifier\|TeamIdentifier' | tr '\n' ' ')"
+
+      - name: pkgbuild
+        run: |
+          set -euo pipefail
+          pkgbuild \
+            --root root \
+            --scripts scripts \
+            --identifier br.com.acessofast.installer \
+            --version "${{ inputs.versao }}" \
+            --install-location / \
+            componente.pkg
+          productbuild --package componente.pkg "AcessoFast-${{ inputs.versao }}.pkg"
+          ls -la *.pkg
+
+      - name: Assinar o instalador
+        env:
+          P12_BASE64: ${{ secrets.MACOS_INSTALLER_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_INSTALLER_P12_PASSWORD }}
+          SIGN_IDENTITY: ${{ vars.MACOS_INSTALLER_IDENTITY }}
+        run: |
+          set -euo pipefail
+          PKG="AcessoFast-${{ inputs.versao }}.pkg"
+          if [ -z "${P12_BASE64:-}" ]; then
+            echo "::warning::MACOS_INSTALLER_P12 ausente — .pkg NAO assinado. O Gatekeeper recusa na maquina de quem baixa; use so para teste interno."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/instalador.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$P12_BASE64" | openssl base64 -d -A -out "$RUNNER_TEMP/inst.p12"
+          security import "$RUNNER_TEMP/inst.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/productsign
+          rm -f "$RUNNER_TEMP/inst.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENT="${SIGN_IDENTITY:-Developer ID Installer}"
+          productsign --sign "$IDENT" "$PKG" "assinado-$PKG"
+          mv "assinado-$PKG" "$PKG"
+          pkgutil --check-signature "$PKG"
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: acessofast-installer-macos
+          path: AcessoFast-*.pkg
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Resumo
+        run: |
+          {
+            echo "## Instalador macOS ${{ inputs.versao }}"
+            echo
+            echo "Baixe em **Artifacts -> acessofast-installer-macos**."
+            echo
+            echo "### O que ele faz na maquina"
+            echo
+            echo "- instala o cliente em \`/Applications/AcessoFast.app\`;"
+            echo "- instala o agente em \`/Library/Application Support/AcessoFast/\`, trancado para root;"
+            echo "- carrega tres servicos: o agente, o daemon do cliente e o servico da sessao grafica;"
+            echo "- NAO pede codigo nenhum — a maquina e adotada pelo ID, como no instalador generico do Windows."
+            echo
+            echo "### O que ele NAO faz"
+            echo
+            echo "Nao concede Gravacao de Tela nem Acessibilidade: no macOS nenhum instalador pode."
+            echo "Quem instala liga a mao nos Ajustes do Sistema, ou recebe um perfil PPPC por MDM."
+          } >> "$GITHUB_STEP_SUMMARY"
