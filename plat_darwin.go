@@ -107,7 +107,12 @@ const clientAppExe = "/Applications/AcessoFast.app/Contents/MacOS/AcessoFast"
 
 // clientLogPattern: glob dos logs irmaos, usado pra recuperar a cauda de um log que
 // acabou de rotacionar (tailRotacionado, em main.go).
-const clientLogPattern = "AcessoFast_r*.log"
+//
+// Mais frouxo que o do Windows ("AcessoFast_r*.log") de proposito: no macOS o
+// PREFIXO do arquivo depende de quando o custom_.txt foi lido (ver clientServerLogGlobs),
+// e um log rotacionado pode ter nascido com o outro nome. Aqui o risco de ser frouxo
+// e nulo — a busca ja acontece dentro do diretorio do log corrente.
+const clientLogPattern = "*_r*.log"
 
 // ---------------------------------------------------------------------------
 // Caminhos do cliente branded
@@ -115,19 +120,25 @@ const clientLogPattern = "AcessoFast_r*.log"
 
 // clientConfigGlobs: onde procurar a config do cliente pra extrair o rustdesk_id.
 //
-// Caminho CONFIRMADO em campo (20/08/2026): o RustDesk 1.4.9 no macOS grava em
-// ~/Library/Preferences/com.carriez.<AppName>/<AppName>.toml — no teste,
-// /Users/vinipaes/Library/Preferences/com.carriez.RustDesk/RustDesk.toml. O build
-// branded troca o AppName para AcessoFast, entao o formato abaixo e o mesmo.
+// COM O CLIENTE BRANDED INSTALADO (coleta de 28/08), a config saiu em
+// ~/Library/Preferences/com.carriez.RustDesk/RustDesk.toml — com o nome ANTIGO,
+// mesmo o app sendo o AcessoFast. Ver a explicacao em clientServerLogGlobs: o
+// diretorio nasce antes de o custom_.txt ser lido.
+//
+// Por isso cobrimos as DUAS formas. O custo de um glob a mais e zero; o custo de
+// procurar so a forma certa e nao achar e o agente sem rustdesk_id.
 //
 // /var/root e o home do root: e la que a config cai quando quem roda e o daemon.
 func clientConfigGlobs() []string {
-	return []string{
-		"/var/root/Library/Preferences/com.carriez.AcessoFast/AcessoFast.toml",
-		"/var/root/Library/Preferences/com.carriez.AcessoFast/AcessoFast2.toml",
-		"/Users/*/Library/Preferences/com.carriez.AcessoFast/AcessoFast.toml",
-		"/Users/*/Library/Preferences/com.carriez.AcessoFast/AcessoFast2.toml",
+	var g []string
+	for _, home := range []string{"/var/root", "/Users/*"} {
+		for _, marca := range []string{"RustDesk", "AcessoFast"} {
+			for _, arq := range []string{marca + ".toml", marca + "2.toml"} {
+				g = append(g, home+"/Library/Preferences/com.carriez."+marca+"/"+arq)
+			}
+		}
 	}
+	return g
 }
 
 // clientServerLogGlobs: o log que carrega os marcadores de conexao.
@@ -147,11 +158,32 @@ func clientConfigGlobs() []string {
 // root (se o servico instalado gravar no home dele). O agente roda como root e le os
 // dois. Qual deles vale com o servico instalado ainda esta por confirmar — na coleta
 // o app rodava direto do DMG, sem servico registrado.
+// O NOME DO DIRETORIO NAO E O QUE PARECE. Coleta de 28/08, com o cliente branded
+// instalado, achou o log em
+//
+//	/Users/alexandrepaes/Library/Logs/RustDesk/AcessoFast_rCURRENT.log
+//	                                  ^^^^^^^^  ^^^^^^^^^^
+//	                                  antigo    novo
+//
+// O fonte monta o caminho como Library/Logs/{APP_NAME} (hbb_common/src/config.rs,
+// log_path), entao o diretorio deveria ser AcessoFast. Ele nao e porque o diretorio
+// nasce ANTES de o custom_.txt ser lido — quando APP_NAME ainda vale "RustDesk". So
+// o nome do ARQUIVO, montado depois, pega o nome novo.
+//
+// Isso pode mudar sozinho numa atualizacao do RustDesk, nos dois sentidos. Por isso
+// cobrimos as quatro combinacoes: a assimetria de hoje, o par coerente antigo e o
+// par coerente novo. Errar aqui e o pior defeito possivel deste agente — ele fica
+// cego, tudo parece funcionar, e nenhuma sessao e faturada.
 func clientServerLogGlobs() []string {
-	return []string{
-		"/var/root/Library/Logs/AcessoFast/AcessoFast_rCURRENT.log",
-		"/Users/*/Library/Logs/AcessoFast/AcessoFast_rCURRENT.log",
+	var g []string
+	for _, home := range []string{"/var/root", "/Users/*"} {
+		for _, dir := range []string{"RustDesk", "AcessoFast"} {
+			for _, prefixo := range []string{"AcessoFast", "RustDesk"} {
+				g = append(g, home+"/Library/Logs/"+dir+"/"+prefixo+"_rCURRENT.log")
+			}
+		}
 	}
+	return g
 }
 
 // findRustDeskExe localiza o executavel do cliente branded dentro do bundle .app.

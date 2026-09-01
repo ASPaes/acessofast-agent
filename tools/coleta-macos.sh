@@ -61,21 +61,27 @@ echo "----- 4. Processos e o formato do 'ps' -------------------------"
 # CRITICO: o agente le o horario de inicio do processo com 'ps -o lstart='. Se este
 # Mac responder com mes/dia em PORTUGUES, o parser precisa mudar — e so daqui da pra
 # saber, porque depende do idioma da maquina.
-ps -axo pid,user,lstart,comm | grep -i "[r]ustdesk" || echo "(nenhum processo RustDesk rodando)"
-# Prefere o AcessoFast (cliente branded); cai pro RustDesk oficial se for ele que
-# estiver instalado.
+# Com os ARGUMENTOS, e nao so o nome: no macOS o cliente se divide em varios
+# processos (--server, --cm, a interface) e SO UM deles segura os sockets da sessao.
+# Descobrir qual e o ponto desta secao — o agente precisa vigiar o certo.
+ps -axo pid,user,lstart,args | grep -iE "[a]cessofast|[r]ustdesk" \
+	|| echo "(nenhum processo do cliente rodando)"
+
 APP=""
 for cand in /Applications/AcessoFast.app /Applications/RustDesk.app; do
 	[ -d "$cand" ] && APP="$cand" && break
 done
 EXEBASE="$(basename "${APP%.app}" 2>/dev/null)"
-PID=""
-[ -n "$APP" ] && PID=$(pgrep -f "$APP/Contents/MacOS/$EXEBASE" 2>/dev/null | head -1)
+PIDS=""
+[ -n "$APP" ] && PIDS=$(pgrep -f "$APP/Contents/MacOS/$EXEBASE" 2>/dev/null)
+PID="$(echo "$PIDS" | head -1)"
+echo "PIDs do cliente: $(echo $PIDS | tr '\n' ' ')"
 if [ -n "$PID" ]; then
-	echo "PID escolhido: $PID"
-	echo "saida crua do 'ps -o lstart=' -> [$(ps -o lstart= -p "$PID")]"
+	# As duas leituras do horario: a do idioma da maquina e a que o agente usa.
+	echo "ps -o lstart=          -> [$(ps -o lstart= -p "$PID")]"
+	echo "ps -o lstart= (LC_ALL=C) -> [$(LC_ALL=C ps -o lstart= -p "$PID")]"
 else
-	echo "pgrep nao achou o processo pelo caminho completo do executavel"
+	echo "pgrep nao achou processo pelo caminho completo do executavel"
 fi
 
 echo
@@ -125,12 +131,16 @@ echo
 echo "----- 8. Sockets do processo (prova de sessao viva) ------------"
 # O agente usa isto pra detectar sessao fantasma: socket ESTABLISHED que nao seja o
 # vinculo ocioso com o rendezvous significa que tem gente conectada.
-if [ -n "$PID" ]; then
-	echo "# saida crua do lsof -Fn (e o formato que o parser le):"
-	sudo lsof -nP -a -p "$PID" -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null | sed 's/^/    /' \
-		|| echo "    (lsof nao retornou nada — na fase 'durante' isso seria um problema)"
-	echo "# a mesma coisa em formato humano, pra conferir:"
-	sudo lsof -nP -a -p "$PID" -iTCP -sTCP:ESTABLISHED 2>/dev/null | sed 's/^/    /'
+# UM POR UM: na coleta anterior olhamos so o primeiro PID e o lsof veio vazio, o que
+# nao prova ausencia de sessao — prova que o socket estava em OUTRO processo.
+if [ -n "$PIDS" ]; then
+	for p in $PIDS; do
+		echo "### pid $p — $(ps -o args= -p "$p" 2>/dev/null | cut -c1-100)"
+		echo "    -Fn (o formato que o parser do agente le):"
+		sudo lsof -nP -a -p "$p" -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null | sed 's/^/      /'
+		echo "    humano:"
+		sudo lsof -nP -a -p "$p" -iTCP -sTCP:ESTABLISHED 2>/dev/null | sed 's/^/      /'
+	done
 else
 	echo "(sem PID)"
 fi
