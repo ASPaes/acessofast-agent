@@ -146,3 +146,85 @@ func TestParseLstartRejeitaSaidaLocalizada(t *testing.T) {
 		t.Error("parseLstart recusou a saida em C locale, que e a que o agente forca")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DAQUI PRA BAIXO, SAIDA REAL. Coleta de 01/09/2026 num MacBook Pro (macOS 26.5.2,
+// arm64) com o cliente branded instalado e uma sessao de verdade aberta a partir do
+// Windows. Ate aqui os testes usavam saida que EU inventei; estes usam a que a
+// maquina respondeu.
+// ---------------------------------------------------------------------------
+
+// O cliente se divide em dois processos e so um segura o socket da sessao. Vigiar o
+// errado daria "sem socket" com sessao viva — e o agente encerraria a sessao de quem
+// esta trabalhando, achando que era fantasma.
+func TestPidDoServidorIgnoraOCm(t *testing.T) {
+	const exe = "/Applications/AcessoFast.app/Contents/MacOS/AcessoFast"
+	saida := "  38229 " + exe + "\n" +
+		"  38975 " + exe + " --cm\n"
+
+	got, ok := pidDoServidor(saida, exe)
+	if !ok {
+		t.Fatal("nao achou o processo do servidor")
+	}
+	if got != 38229 {
+		t.Errorf("pidDoServidor = %d, esperava 38229 (o --cm e 38975 e nao vale)", got)
+	}
+}
+
+func TestPidDoServidorSemCliente(t *testing.T) {
+	const exe = "/Applications/AcessoFast.app/Contents/MacOS/AcessoFast"
+	casos := map[string]string{
+		"nenhum processo":      "",
+		"so o cm":              "  38975 " + exe + " --cm\n",
+		"outro app parecido":   "  4242 /Applications/RustDesk.app/Contents/MacOS/RustDesk\n",
+		"linha sem pid valido": "  abc " + exe + "\n",
+	}
+	for nome, saida := range casos {
+		if _, ok := pidDoServidor(saida, exe); ok {
+			t.Errorf("%s: devia dar false", nome)
+		}
+	}
+}
+
+// A sessao real foi DIRETA (as duas maquinas na mesma rede), e o unico socket
+// ESTABLISHED do cliente era o do peer, numa porta efemera:
+//
+//	n192.168.35.145:58697->192.168.35.111:55901
+//
+// Isto derrubou uma suposicao minha: eu esperava ver tambem o vinculo ocioso com o
+// rendezvous, como no Windows. No macOS ele nao aparece como TCP ESTABLISHED — a
+// maquina ociosa simplesmente nao tem socket nenhum.
+//
+// A regra continua valendo sem mudanca (ocioso=0, sessao=1), mas por um caminho
+// diferente do que eu tinha em mente, e este teste fixa o caso real.
+func TestContaSocketsSessaoComSaidaRealDeCampo(t *testing.T) {
+	// Exatamente como o lsof -Fn respondeu, com a linha do descritor no meio.
+	durante := "p38229\nf50\nn192.168.35.145:58697->192.168.35.111:55901\n"
+	if got := contaSocketsSessao(durante); got != 1 {
+		t.Errorf("sessao viva deu %d, esperava 1", got)
+	}
+
+	// Depois de encerrar, o lsof nao devolveu NADA — nem cabecalho.
+	if got := contaSocketsSessao(""); got != 0 {
+		t.Errorf("apos encerrar deu %d, esperava 0", got)
+	}
+}
+
+// O ps daquela maquina, em pt-BR e ja com o LC_ALL=C que o agente forca. Repare no
+// dia de um digito ("Sep  1", espaco duplo) e no ENCHIMENTO de espacos no fim — os
+// dois vieram assim do sistema, e os dois quebrariam um parser ingenuo.
+func TestParseLstartComSaidaRealDeCampo(t *testing.T) {
+	got, ok := parseLstart("Tue Sep  1 09:54:38 2026    ", time.UTC)
+	if !ok {
+		t.Fatal("nao interpretou a saida real do ps com LC_ALL=C")
+	}
+	want := time.Date(2026, time.September, 1, 9, 54, 38, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("parseLstart = %s, esperava %s", got, want)
+	}
+
+	// A mesma maquina, sem LC_ALL=C, respondeu assim — e tem que ser recusado.
+	if _, ok := parseLstart("ter  1 set 09:54:38 2026    ", time.UTC); ok {
+		t.Error("aceitou a saida em portugues; o agente depende do LC_ALL=C")
+	}
+}

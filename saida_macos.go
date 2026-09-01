@@ -96,3 +96,36 @@ func parseLstart(saida string, loc *time.Location) (time.Time, bool) {
 	}
 	return t, true
 }
+
+// pidDoServidor acha, na saida de `ps -axo pid=,args=`, o processo do cliente que
+// RECEBE as sessoes — e so ele.
+//
+// PROVA DE CAMPO (01/09/2026, sessao viva): o cliente se divide em dois processos,
+//
+//	38229 /Applications/AcessoFast.app/Contents/MacOS/AcessoFast
+//	38975 /Applications/AcessoFast.app/Contents/MacOS/AcessoFast --cm
+//
+// e o socket da sessao estava SO no primeiro; o --cm (gerenciador de conexoes, a
+// janelinha que mostra quem esta conectado) nao tinha socket nenhum. Vigiar o
+// processo errado daria "sem socket" com sessao viva — e o agente encerraria a
+// sessao de quem esta trabalhando, achando que era fantasma.
+//
+// O criterio e a AUSENCIA de argumento: o servidor roda com o caminho do executavel
+// e nada mais. Escolher pelo menor PID funcionaria hoje (o --cm nasce depois, com PID
+// maior), mas por coincidencia, nao por regra.
+func pidDoServidor(saidaPs, exe string) (uint32, bool) {
+	for _, linha := range strings.Split(saidaPs, "\n") {
+		campos := strings.Fields(linha)
+		// Exatamente dois campos: o pid e o caminho. Tres ou mais significa que ha
+		// argumento (--cm e o que se ve hoje), e ai nao e o servidor.
+		if len(campos) != 2 || campos[1] != exe {
+			continue
+		}
+		pid, err := strconv.ParseUint(campos[0], 10, 32)
+		if err != nil || pid == 0 {
+			continue
+		}
+		return uint32(pid), true
+	}
+	return 0, false
+}

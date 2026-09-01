@@ -44,6 +44,21 @@
 //     RustDesk oficial, o que mantem as permissoes de tela e acessibilidade
 //     separadas das dele.
 //
+// CONFIRMADO EM SESSAO REAL (01/09/2026, cliente branded, Mac arm64, conexao vinda
+// de um Windows): o log recebe os mesmos marcadores do Windows, inclusive a linha
+// que o nosso patch injeta —
+//
+//	#1641 Connection opened from 192.168.35.111:50307.
+//	#1641 peer_id 307871329
+//	#1641 Connection closed: Peer close
+//
+// ou seja, deteccao de sessao e auto-adocao valem no macOS sem mudanca de regra.
+//
+// UMA SUPOSICAO MINHA CAIU: eu esperava ver o vinculo ocioso com o rendezvous entre
+// os sockets, como no Windows. No macOS ele NAO aparece como TCP ESTABLISHED — a
+// maquina ociosa nao tem socket nenhum, e durante a sessao aparece um so, o do peer.
+// A regra (ocioso=0, sessao>0) continua valendo, mas por outro caminho.
+//
 // AINDA POR CONFIRMAR: onde o log cai quando o cliente roda como SERVICO instalado.
 // Na coleta o app rodava a partir do DMG montado, sem servico nenhum registrado no
 // launchd — entao o que se viu foi o log da sessao do USUARIO. Por isso os globs
@@ -230,24 +245,25 @@ func hardenDir(dir string) error {
 // Processo do cliente branded (fontes de verdade FORA do log)
 // ---------------------------------------------------------------------------
 
-// clientProcPID devolve o PID do processo do cliente branded. (0, false) quando ele
-// nao esta rodando — nesse caso ninguem age.
+// clientProcPID devolve o PID do processo do cliente que RECEBE as sessoes.
+// (0, false) quando ele nao esta rodando — nesse caso ninguem age.
 //
-// pgrep -f casa pelo caminho COMPLETO do executavel, e nao pelo nome: o bundle pode
-// ter processos auxiliares e derrubar a sessao por causa do processo errado seria o
-// tipo de erro que so aparece na maquina do cliente.
+// NAO da pra usar pgrep aqui, e a coleta de campo (01/09) mostrou por que: o cliente
+// se divide em dois processos com o MESMO caminho de executavel,
+//
+//	38229 .../AcessoFast          <- o servidor, e onde esta o socket da sessao
+//	38975 .../AcessoFast --cm     <- o gerenciador de conexoes, sem socket nenhum
+//
+// e o pgrep so devolve PIDs, sem os argumentos que os distinguem. Pegar o errado daria
+// "sem socket" com sessao viva, e o agente encerraria a sessao de quem esta
+// trabalhando achando que era fantasma. Por isso lemos o ps com os argumentos e a
+// escolha vive em pidDoServidor (saida_macos.go), que tem teste com a saida real.
 func clientProcPID() (uint32, bool) {
-	out, err := exec.Command("pgrep", "-f", clientAppExe).Output()
+	out, err := exec.Command("ps", "-axo", "pid=,args=").Output()
 	if err != nil {
 		return 0, false
 	}
-	for _, linha := range strings.Fields(string(out)) {
-		pid, err := strconv.ParseUint(strings.TrimSpace(linha), 10, 32)
-		if err == nil && pid > 0 {
-			return uint32(pid), true
-		}
-	}
-	return 0, false
+	return pidDoServidor(string(out), clientAppExe)
 }
 
 // clientProcStartTime devolve o horario de inicio do processo do cliente branded.
