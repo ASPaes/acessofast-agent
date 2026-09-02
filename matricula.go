@@ -33,10 +33,29 @@ import (
 )
 
 const (
-	claimRegisterURL  = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/claim-register"
-	claimStatusURL    = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/claim-status"
-	enrollStateFile   = baseDir + `\enroll.state` // {nonce, token} persistido durante a matricula
-	claimPollInterval = 15 * time.Second
+	claimRegisterURL = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/claim-register"
+	claimStatusURL   = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/claim-status"
+	enrollStateFile  = baseDir + `\enroll.state` // {nonce, token, started_at} persistido durante a matricula
+
+	// Cadencia do poll em DUAS velocidades. Antes era 15s fixo pra sempre, e o
+	// "pra sempre" era literal: uma maquina instalada e nunca adotada seguia
+	// perguntando 5.760 vezes por dia, indefinidamente. Em 02/09/2026 isso era
+	// 146 mil chamadas/dia — 56% de TODAS as invocacoes de edge function do
+	// projeto, vindas de 61 maquinas que ninguem nunca adotou.
+	//
+	// A pressa so vale no comeco: uma maquina recem-instalada pode ser aprovada a
+	// qualquer segundo, e ai os 15s importam. Uma que espera ha dias nao vai ser
+	// aprovada nos proximos minutos. Entao a janela quente fica IDENTICA ao que
+	// era (nada muda na instalacao normal, que e o que o operador sente) e so
+	// depois dela o agente desacelera.
+	claimPollHot   = 15 * time.Second // <= claimHotWindow: mesma experiencia de sempre
+	claimPollCold  = 10 * time.Minute // depois disso: o pedido claramente ficou esquecido
+	claimHotWindow = 2 * time.Hour
+
+	// Sondagem LOCAL do RustDesk ID enquanto o cliente sobe. Compartilhava a
+	// constante do poll por coincidencia de valor, mas nao tem nada a ver: nao
+	// fala com o servidor, e esticar isto atrasaria a partida do agente.
+	ridProbeInterval = 15 * time.Second
 )
 
 // enrollState e persistido em disco (ACL restrita) para sobreviver a restart:
@@ -44,6 +63,13 @@ const (
 type enrollState struct {
 	Nonce string `json:"nonce"` // prova de posse (nunca sai da maquina, exceto no poll TLS)
 	Token string `json:"token"` // vira agent.token na adocao; so o hash e registrado
+	// Instante em que ESTA matricula comecou, ancora da cadencia do poll. Vive no
+	// disco de proposito: em memoria, um restart do servico devolveria a maquina
+	// pra janela quente, e a matricula re-registra o claim de hora em hora (o
+	// claim expira), o que zeraria um contador ancorado no pedido atual. Nos dois
+	// casos o poll de 15s voltaria pra sempre — exatamente o que estamos tirando.
+	// omitempty: enroll.state ja gravado por versao anterior nao tem o campo.
+	StartedAt time.Time `json:"started_at,omitempty"`
 }
 
 func randB64URL(n int) string {
@@ -75,14 +101,37 @@ func loadOrCreateState() enrollState {
 	if raw, err := os.ReadFile(enrollStateFile); err == nil {
 		var st enrollState
 		if json.Unmarshal(raw, &st) == nil && st.Nonce != "" && st.Token != "" {
+			// Estado gravado por versao anterior nao tem started_at. Carimba AGORA e
+			// persiste: a maquina ganha uma ultima janela quente (uma vez so, ~480
+			// chamadas) e depois entra na cadencia lenta. O caminho oposto — tratar
+			// zero como "antiquissimo" — jogaria direto pro poll de 10 min uma
+			// matricula que talvez tenha comecado ha 5 minutos, atrasando uma adocao
+			// legitima em curso. Errar pro lado do operador.
+			if st.StartedAt.IsZero() {
+				st.StartedAt = time.Now()
+				if err := writeEnrollState(st); err != nil {
+					logln("matricula: WARN nao persistiu started_at: %v (janela quente por sessao)", err)
+				}
+			}
 			return st
 		}
 	}
-	st := enrollState{Nonce: randB64URL(32), Token: randB64URL(32)}
+	st := enrollState{Nonce: randB64URL(32), Token: randB64URL(32), StartedAt: time.Now()}
 	if err := writeEnrollState(st); err != nil {
 		logln("matricula: WARN nao persistiu enroll.state: %v (seguindo em memoria)", err)
 	}
 	return st
+}
+
+// claimPollDelay: 15s enquanto a matricula e recente, 10 min depois disso.
+//
+// StartedAt zerado (o writeEnrollState falhou e nao ha disco onde ancorar) cai na
+// janela quente: sem ancora confiavel, o certo e nao atrasar uma adocao real.
+func claimPollDelay(startedAt time.Time) time.Duration {
+	if startedAt.IsZero() || time.Since(startedAt) < claimHotWindow {
+		return claimPollHot
+	}
+	return claimPollCold
 }
 
 // waitForRustDeskID bloqueia ate o ID existir (ou stop). O cliente pode estar subindo.
@@ -100,7 +149,7 @@ func waitForRustDeskID(stop <-chan struct{}) (string, bool) {
 		select {
 		case <-stop:
 			return "", false
-		case <-time.After(claimPollInterval):
+		case <-time.After(ridProbeInterval):
 		}
 	}
 }
@@ -194,11 +243,18 @@ func startMatricula(stop <-chan struct{}) bool {
 // token persistido e o MESMO ja usado nos eventos de sessao (st.Token), entao a
 // transicao e transparente pro tailer, que segue rodando sem interrupcao.
 func finalizeMatricula(stop <-chan struct{}, rid string, st enrollState, nonceHash, tokenHash, host, osStr string) {
+	esfriou := false
 	for {
+		delay := claimPollDelay(st.StartedAt)
+		if delay == claimPollCold && !esfriou {
+			esfriou = true
+			logln("matricula: sem adocao ha %s — poll passa a %s (a adocao ainda funciona, so demora ate esse tempo pra ser notada)",
+				claimHotWindow, claimPollCold)
+		}
 		select {
 		case <-stop:
 			return
-		case <-time.After(claimPollInterval):
+		case <-time.After(delay):
 		}
 
 		switch postClaimStatus(rid, st.Nonce) {
