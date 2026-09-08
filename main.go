@@ -268,6 +268,23 @@ type ingestResp struct {
 	// quando o alvo resolvido no servidor difere da versao que este agente reportou.
 	// Ver update.go.
 	Update *updateInfo `json:"update"`
+	// Aviso para MOSTRAR NA TELA desta maquina. Hoje ha um caso: o operador
+	// acessou, direto pelo cliente, um computador cujo AcessoFast esta velho
+	// demais para se atualizar sozinho.
+	//
+	// Por que o aviso chega AQUI e nao na maquina acessada: quem desenharia a
+	// janela la seria o agente dela — e e justamente o desatualizado. Entao o
+	// servidor identifica o operador pelo controller_rustdesk_id que a maquina
+	// acessada reporta no 'start', e devolve o aviso no presence DELE.
+	//
+	// O texto vem pronto do servidor de proposito: melhorar a redacao nao pode
+	// exigir rollout de binario na frota inteira.
+	Aviso *avisoServidor `json:"aviso"`
+}
+
+type avisoServidor struct {
+	Titulo   string `json:"titulo"`
+	Mensagem string `json:"mensagem"`
 }
 
 // postEvent posta um evento de sessao e devolve o hard_cap_at da resposta (zero se
@@ -349,6 +366,15 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 			logln("WARN hard_cap_at ilegivel: %q", r.HardCapAt)
 		}
 	}
+
+	// Recado do servidor para a tela desta maquina (ver aviso.go). Tratado aqui e
+	// nao devolvido ao chamador de proposito: e efeito colateral da resposta, nao
+	// um valor que start/heartbeat/end precisem conhecer — devolver mudaria a
+	// assinatura de uma funcao com varios chamadores para nada.
+	if r.Aviso != nil {
+		mostraAviso(r.Aviso)
+	}
+
 	return cap, r.Update
 }
 
