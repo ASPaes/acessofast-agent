@@ -147,17 +147,29 @@ jobs:
 
           URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${AGENT_VERSION}/acessofast-agent.exe"
 
-          # O SQL sai no resumo do job, e nao aplicado daqui, de proposito: publicar
-          # no catalogo NAO instala nada (quem instala e o alvo), mas o CI tambem nao
-          # tem — nem deve ter — credencial de escrita no banco de producao.
+          # O SQL nao e aplicado daqui, de proposito: publicar no catalogo NAO instala
+          # nada (quem instala e o alvo), mas o CI tambem nao tem — nem deve ter —
+          # credencial de escrita no banco de producao.
+          #
+          # Ele sai em DOIS lugares, e isso importa: nao existe endpoint REST para step
+          # summary (conferido em 28/08/2026 — /actions/jobs/<id>/summary responde 404).
+          # Quem cataloga na mao le o resumo; quem cataloga por ferramenta so alcanca o
+          # LOG. Com o SQL apenas no resumo, catalogar virava copia-e-cola obrigatoria,
+          # e a assinatura nao tem outra fonte: a chave privada so existe no secret.
+          SQL_CATALOGO="insert into public.agent_releases (version, platform, url, sha256, signature, notes)
+          values ('${AGENT_VERSION}', 'windows', '${URL}', '${SHA256}', '${SIG}', 'build de ${GITHUB_SHA}');"
+
+          echo "::group::SQL para catalogar ${AGENT_VERSION}"
+          echo "${SQL_CATALOGO}"
+          echo "::endgroup::"
+
           {
             echo "## Release ${AGENT_VERSION} publicado"
             echo
             echo "Para catalogar (nao instala em ninguem — quem instala e o alvo):"
             echo
             echo '```sql'
-            echo "insert into public.agent_releases (version, platform, url, sha256, signature, notes)"
-            echo "values ('${AGENT_VERSION}', 'windows', '${URL}', '${SHA256}', '${SIG}', 'build de ${GITHUB_SHA}');"
+            echo "${SQL_CATALOGO}"
             echo '```'
             echo
             echo "Depois, para liberar em UMA maquina (canary):"
