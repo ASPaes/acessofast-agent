@@ -280,6 +280,12 @@ type ingestResp struct {
 	// O texto vem pronto do servidor de proposito: melhorar a redacao nao pode
 	// exigir rollout de binario na frota inteira.
 	Aviso *avisoServidor `json:"aviso"`
+	// Passo 1 (Aposentar a senha rotativa): modo de rotacao resolvido no servidor em
+	// cascata device -> tenant -> global. So vem no 'presence', e SEMPRE vem — mesmo
+	// quando e 'session' — senao reverter o canario nunca chegaria ao agente. Ausente
+	// (servidor antigo, falha na resolucao) = o agente mantem o que tem em cache. Ver
+	// rotacao_modo.go.
+	Rotacao string `json:"rotacao"`
 }
 
 type avisoServidor struct {
@@ -313,6 +319,10 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 		// 1 min, sem nenhuma requisicao nova. O servidor grava em
 		// address_book.agent_version.
 		"agent_version": version,
+		// Passo 1: o modo que este agente esta APLICANDO de fato. O servidor grava em
+		// address_book.rotacao_modo_efetivo — e o par de rotacao_modo como agent_version
+		// e de agent_target_version: e o que prova, no canario, que a maquina obedece.
+		"rotacao_modo": modoRotacao(),
 	}
 	// controller_rustdesk_id (auto-adocao): rustdesk_id do peer (controlador), quando
 	// conhecido. So no 'start' serve de gatilho pro servidor auto-adotar um device ainda
@@ -373,6 +383,13 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 	// assinatura de uma funcao com varios chamadores para nada.
 	if r.Aviso != nil {
 		mostraAviso(r.Aviso)
+	}
+
+	// Passo 1: modo de rotacao do servidor. Mesmo raciocinio do aviso — efeito
+	// colateral da resposta. So atualiza quando veio: campo ausente NAO e "session", e
+	// trata-lo assim faria uma falha transitoria do servidor religar a rotacao.
+	if r.Rotacao != "" {
+		gravaModoRotacao(r.Rotacao)
 	}
 
 	return cap, r.Update
@@ -467,6 +484,11 @@ func (t *tailer) rotacionarSeAutenticada(motivo string) {
 	t.autenticada = false
 	if !autenticada {
 		logln("ROTATE suprimido (%s): nenhuma conexao autenticou — senha do painel mantida", motivo)
+		return
+	}
+	// Passo 1: fim de sessao e ROTINA — o modo decide. A marca da sessao ja foi limpa
+	// acima, entao suprimir aqui nao deixa estado vazando para a proxima.
+	if !podeRotacionar(gatilhoFimSessao) {
 		return
 	}
 	// Em goroutine: faz exec (--password) + HTTP e nao pode bloquear o poll de deteccao.

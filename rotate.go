@@ -276,6 +276,14 @@ func rotateOnBoot() {
 	if holdActive() {
 		return
 	}
+	// Passo 1: o boot e ROTINA — o modo decide, e ANTES da espera pelo cliente: nao faz
+	// sentido segurar ate 5 min por um cliente que nao vamos usar. O modo sai do cache
+	// em disco, porque o boot vem antes do primeiro presence. Na primeira subida de um
+	// binario recem-atualizado ainda nao ha cache, e o padrao (session) gira uma vez —
+	// esperado, e so nessa subida.
+	if !podeRotacionar(gatilhoBoot) {
+		return
+	}
 	// ESPERA o cliente subir antes de rotacionar. Agente e cliente sao servicos
 	// independentes e no boot sobem em paralelo: sem esta espera o agente ganhava a
 	// corrida, aplicava a senha sem ninguem para receber e o painel ficava servindo
@@ -298,6 +306,11 @@ func rotateOnBoot() {
 // que nao previmos, ela morre no proximo restart do cliente em vez de durar ate alguem
 // perceber e intervir na maquina.
 func rotateAposRestartDoCliente() {
+	// Passo 1: recuperacao, nao rotina — install_only mantem, so off suprime. Ver
+	// decideRotacao em rotacao_modo.go.
+	if !podeRotacionar(gatilhoRestartCliente) {
+		return
+	}
 	logln("ROTATE re-sync: cliente reiniciou e recarregou a config — rotacionando para realinhar com o painel")
 	rotateNow()
 }
