@@ -16,11 +16,12 @@
 // pública do ServerModel. Mesma filosofia do agente Windows, que também deriva
 // estado de observação em vez de instrumentar o RustDesk.
 //
-// Transições (idêntico ao main.go):
+// Transições (idêntico ao main.go). "Ativo" = conexão ACEITA (_emAtendimento):
 //   0 -> N ativos : 'start'   (+ controller_rustdesk_id, dispara auto-adoção)
 //   N ativos      : 'heartbeat' a cada 20s
 //   N -> 0        : 'end'     + ROTAÇÃO da senha
-//   ocioso        : 'presence' a cada 60s
+//   ocioso        : 'presence' a cada 60s — 10 min se o servidor diz que o
+//                   aparelho não está no cadastro (_presenceIntervalSemCadastro)
 //
 // ---------------------------------------------------------------------------
 // INVARIANTE DA ROTAÇÃO (copiada do rotate.go — não inverter a ordem)
@@ -67,6 +68,14 @@ const String _agentVersion =
 const Duration _pollInterval = Duration(seconds: 3);
 const Duration _heartbeatInterval = Duration(seconds: 20);
 const Duration _presenceInterval = Duration(seconds: 60);
+// Aparelho que o servidor diz não estar no cadastro (404) ou cujo token ele não
+// reconhece (401). O caso comum é a matrícula esquecida que o servidor aquietou
+// (ver agent.dart): o app tem credencial, mas ninguém adotou. Ninguém vê o
+// status de um aparelho fora do cadastro, então 60s não serviria a ninguém e
+// custaria 1.440 chamadas por dia por celular. A regra de NÃO espaçar o
+// presence vale para aparelho cadastrado, cujo status o técnico enxerga — esse
+// segue a 60s.
+const Duration _presenceIntervalSemCadastro = Duration(minutes: 10);
 const Duration _retryInterval = Duration(seconds: 30);
 const Duration _httpTimeout = Duration(seconds: 20);
 
@@ -181,8 +190,15 @@ Future<void> _clearPending() async {
   }
 }
 
-/// true SÓ em HTTP 200 — o painel confirmou que gravou.
-Future<bool> _reportRotation(String pw) async {
+enum _Reporte { gravado, descartado, falhou }
+
+/// gravado    = o painel guardou a senha.
+/// descartado = HTTP 200 com discarded:true. O servidor respondeu mas NÃO
+///              guardou: o aparelho não está no cadastro, ou o token não é mais
+///              o dele (rotate-device-secret desde 05/09/2026, para matar o laço
+///              de retry). Retentar nunca resolve.
+/// falhou     = rede ou erro: a pendência segue e o retry reenvia.
+Future<_Reporte> _reportRotation(String pw) async {
   try {
     final r = await http
         .post(
@@ -196,28 +212,56 @@ Future<bool> _reportRotation(String pw) async {
         )
         .timeout(_httpTimeout);
     _log('rotate report -> HTTP ${r.statusCode}');
-    return r.statusCode == 200;
+    if (r.statusCode != 200) return _Reporte.falhou;
+    try {
+      final j = jsonDecode(r.body);
+      if (j is Map && j['discarded'] == true) {
+        _log('rotate report DESCARTADO (${j['reason']}) — o painel não tem esta senha');
+        return _Reporte.descartado;
+      }
+    } catch (_) {
+      // 200 com corpo ilegível: vale como gravado, como sempre valeu
+    }
+    return _Reporte.gravado;
   } catch (e) {
     _log('rotate report FALHOU: $e');
-    return false;
+    return _Reporte.falhou;
+  }
+}
+
+/// O servidor recebeu a senha e não guardou. Sem retentar (o token não muda
+/// sozinho), a pendência sai — mas o painel ficou SEM a senha deste aparelho.
+/// Apagamos a marca da sincronização inicial para ela rodar de novo assim que o
+/// presence provar que o aparelho entrou no cadastro. Sem isto, um celular
+/// aquietado e adotado semanas depois deixaria o "Conectar" do painel preso em
+/// "aguardando o agente", porque a única senha que ele publicou foi descartada.
+Future<void> _senhaDescartada() async {
+  _cadastrado = false;
+  _initialSyncChecked = false;
+  await _clearPending();
+  try {
+    final f = await _file(_pwSyncFlagFile);
+    if (await f.exists()) await f.delete();
+  } catch (_) {
+    // best-effort: sem apagar, a próxima sessão ainda re-sincroniza no 'end'
   }
 }
 
 bool _rotating = false; // serializa: dois 'end' seguidos não rodam concorrentes
 
-/// Retorna true se a senha foi APLICADA no aparelho (o painel recebe via
-/// reporte ou pelo laço de retry). false = não aplicou (núcleo ainda subindo,
-/// sem credencial, ou já rotacionando) — o chamador pode reintentar.
-Future<bool> _rotateNow() async {
+/// null = a senha NÃO foi aplicada no aparelho (núcleo ainda subindo, sem
+/// credencial, ou já rotacionando) — o chamador pode reintentar. Senão, o que
+/// o painel fez com o reporte da senha aplicada.
+Future<_Reporte?> _rotateNow() async {
   if (_rotating) {
     _log('rotação já em andamento, pulando');
-    return false;
+    return null;
   }
   _rotating = true;
   try {
     if (!await _loadCredentials()) {
       _log('ROTATE skip: sem credencial (matrícula pendente?)');
-      return false;
+      return null;
     }
 
     final pw = _genPassword();
@@ -229,11 +273,11 @@ Future<bool> _rotateNow() async {
       applied = await bind.mainSetPermanentPasswordWithResult(password: pw);
     } catch (e) {
       _log('ROTATE ABORT: setPermanentPassword lançou: $e');
-      return false;
+      return null;
     }
     if (!applied) {
       _log('ROTATE ABORT: setPermanentPassword retornou false (senha antiga mantida)');
-      return false;
+      return null;
     }
 
     // 2) a senha nova JÁ está no aparelho -> registra a pendência antes de
@@ -244,14 +288,22 @@ Future<bool> _rotateNow() async {
       _log('ROTATE WARN: não persistiu pendência: $e (seguindo em memória)');
     }
 
-    // 3) reporta; sucesso -> limpa. Falha -> o laço de retry reenvia.
-    if (await _reportRotation(pw)) {
-      await _clearPending();
-      _log('ROTATE ok');
-    } else {
-      _log('ROTATE pendente — o retry reenvia');
+    // 3) reporta; gravado -> limpa. Falhou -> o laço de retry reenvia.
+    //    Descartado -> não adianta retentar; espera o aparelho entrar no cadastro.
+    final rep = await _reportRotation(pw);
+    switch (rep) {
+      case _Reporte.gravado:
+        await _clearPending();
+        _log('ROTATE ok');
+        break;
+      case _Reporte.descartado:
+        await _senhaDescartada();
+        break;
+      case _Reporte.falhou:
+        _log('ROTATE pendente — o retry reenvia');
+        break;
     }
-    return true; // aplicada no aparelho (reporte pode ficar pendente)
+    return rep; // aplicada no aparelho; rep diz o que o painel fez com ela
   } finally {
     _rotating = false;
   }
@@ -263,9 +315,16 @@ Future<void> _retryPendingRotation() async {
   final pw = await _readPending();
   if (pw == null) return;
   if (!await _loadCredentials()) return;
-  if (await _reportRotation(pw)) {
-    await _clearPending();
-    _log('pendência de rotação confirmada');
+  switch (await _reportRotation(pw)) {
+    case _Reporte.gravado:
+      await _clearPending();
+      _log('pendência de rotação confirmada');
+      break;
+    case _Reporte.descartado:
+      await _senhaDescartada();
+      break;
+    case _Reporte.falhou:
+      break; // tenta de novo no próximo _retryInterval
   }
 }
 
@@ -273,12 +332,32 @@ Future<void> _retryPendingRotation() async {
 // Telemetria de sessão
 // ---------------------------------------------------------------------------
 
-Future<void> _postEvent(String event, {String? controllerId}) async {
+/// O que a resposta do session-ingest diz sobre o cadastro deste aparelho.
+/// 200 = no cadastro e token aceito. 404 = não está no cadastro. 401 = o token
+/// não é mais o dele. Os demais (400, 403, 5xx, rede) não dizem nada sobre o
+/// cadastro e não mudam o estado.
+void _notarCadastro(int status) {
+  if (status == 200) {
+    if (_cadastrado == false) {
+      _log('aparelho está no cadastro — presence volta a 60s');
+    }
+    _cadastrado = true;
+  } else if (status == 404 || status == 401) {
+    if (_cadastrado != false) {
+      _log('servidor diz que o aparelho não está no cadastro (HTTP $status) '
+          '— presence a cada ${_presenceIntervalSemCadastro.inMinutes} min');
+    }
+    _cadastrado = false;
+  }
+}
+
+/// Status HTTP da resposta; 0 se não postou (sem credencial) ou a rede falhou.
+Future<int> _postEvent(String event, {String? controllerId}) async {
   // Guarda idêntica ao postEvent do main.go: sem credencial a session-ingest
   // rejeitaria, e postar a cada 60s só geraria ruído.
   if (!await _loadCredentials()) {
     _log('SKIP $event: sem credencial (matrícula pendente?)');
-    return;
+    return 0;
   }
   try {
     final body = <String, String>{
@@ -297,14 +376,25 @@ Future<void> _postEvent(String event, {String? controllerId}) async {
         .post(Uri.parse(_ingestUrl), headers: _headers, body: jsonEncode(body))
         .timeout(_httpTimeout);
     _log('$event -> HTTP ${r.statusCode}');
+    _notarCadastro(r.statusCode);
+    return r.statusCode;
   } catch (e) {
     _log('POST $event falhou: $e');
+    return 0;
   }
 }
 
+/// Só conta como atendimento a conexão ACEITA. No Android o RustDesk põe na
+/// lista, com authorized=false, quem ainda espera o "aceitar" na tela — é o que
+/// acontece quando a senha não bate. Contá-la abria um atendimento (e cobrança)
+/// para uma tentativa que o cliente nunca aceitou, e o 'end' dela girava a
+/// senha. Mesma correção do agente Windows ("senha errada girava a senha",
+/// 25/08/2026). Se o cliente aceitar, ela vira authorized=true e entra.
+bool _emAtendimento(Client c) => !c.disconnected && c.authorized;
+
 int _activeCount() {
   try {
-    return gFFI.serverModel.clients.where((c) => !c.disconnected).length;
+    return gFFI.serverModel.clients.where(_emAtendimento).length;
   } catch (_) {
     return 0;
   }
@@ -312,7 +402,7 @@ int _activeCount() {
 
 String _controllerId() {
   try {
-    final ativos = gFFI.serverModel.clients.where((c) => !c.disconnected);
+    final ativos = gFFI.serverModel.clients.where(_emAtendimento);
     if (ativos.isEmpty) return '';
     // peerId é o rustdesk_id de quem conectou (o controlador).
     return ativos.first.peerId.replaceAll(RegExp(r'\D'), '');
@@ -322,6 +412,9 @@ String _controllerId() {
 }
 
 int _prevActive = 0;
+// null = ainda não sabemos (nenhuma resposta desde que o app abriu). Ver
+// _notarCadastro e _presenceIntervalSemCadastro.
+bool? _cadastrado;
 DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
 DateTime _lastPresence = DateTime.fromMillisecondsSinceEpoch(0);
 DateTime _lastRetry = DateTime.fromMillisecondsSinceEpoch(0);
@@ -343,6 +436,10 @@ bool _initialSyncChecked = false;
 /// sincronizado dai em diante.
 Future<void> _maybeInitialSync() async {
   if (_initialSyncChecked) return;
+  // O servidor já disse que o aparelho não está no cadastro: rotacionar agora
+  // só geraria outro descarte (e outra chamada a cada tick de 3s). Espera o
+  // presence provar a adoção com um 200.
+  if (_cadastrado == false) return;
   try {
     final f = await _file(_pwSyncFlagFile);
     if (await f.exists()) {
@@ -353,13 +450,16 @@ Future<void> _maybeInitialSync() async {
     if (!await _loadCredentials()) return;
 
     _log('sincronizacao inicial da senha (1o acesso)');
-    final applied = await _rotateNow(); // gera + aplica no aparelho + reporta
-    if (applied) {
-      _initialSyncChecked = true;
-      await f.writeAsString(jsonEncode({'done': true}), flush: true);
-    }
+    final rep = await _rotateNow(); // gera + aplica no aparelho + reporta
     // Nao aplicou (nucleo ainda subindo)? _initialSyncChecked segue false e o
     // proximo tick tenta de novo — sem gravar a marca.
+    if (rep == null) return;
+    // Descartado: o painel NAO tem a senha. _senhaDescartada ja armou a espera
+    // pelo cadastro; gravar a marca aqui travaria o "Conectar" do painel.
+    if (rep == _Reporte.descartado) return;
+    // Gravado, ou falhou na rede (a pendencia entrega depois): sincronizado.
+    _initialSyncChecked = true;
+    await f.writeAsString(jsonEncode({'done': true}), flush: true);
   } catch (e) {
     _log('sync inicial da senha falhou: $e (tentara de novo)');
   }
@@ -389,7 +489,10 @@ Future<void> _tick() async {
     await _rotateNow();
     _lastPresence = now;
   } else {
-    if (now.difference(_lastPresence) >= _presenceInterval) {
+    final intervalo = _cadastrado == false
+        ? _presenceIntervalSemCadastro
+        : _presenceInterval;
+    if (now.difference(_lastPresence) >= intervalo) {
       await _postEvent('presence');
       _lastPresence = now;
     }
