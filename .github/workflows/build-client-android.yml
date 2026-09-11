@@ -52,9 +52,16 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Tag do RustDesk a buildar (ex: 1.4.9)'
+        description: 'Tag ou commit (SHA completo) do RustDesk a buildar'
         required: true
-        default: '1.4.9'
+        # 1ec1b9e = "fix: android: target API 36 (#15603)", no master do upstream
+        # (31/08/2026). Ainda nao ha tag com isso: o ultimo release e o 1.4.9,
+        # que mira a API 33, e a Play Store exige API 36 desde 31/08/2026.
+        # Traz junto o d4b06a6 (#15602), que troca o MANAGE_EXTERNAL_STORAGE
+        # (acesso remoto nao e uso permitido na Play) por armazenamento com
+        # escopo, sem perder a transferencia de arquivos.
+        # Quando sair uma tag que contenha esse commit, voltar pra tag.
+        default: '1ec1b9e7e3808b24bfc923ee1e6800ab9694e9a5'
         type: string
       gerar_aab:
         description: 'Gerar tambem o .aab (Android App Bundle) para publicar na Play Store'
@@ -67,7 +74,8 @@ env:
   CARGO_NDK_VERSION: "3.1.2"
   ANDROID_FLUTTER_VERSION: "3.24.5"
   NDK_VERSION: "r28c"
-  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  # O commit do vcpkg NAO fica fixo aqui: vem do vcpkg.json do RustDesk
+  # buildado (step 'Baseline do vcpkg').
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   VERSION: "${{ inputs.version }}"
 
@@ -232,12 +240,14 @@ jobs:
                libxdo-dev libxfixes-dev llvm-dev nasm ninja-build \
                openjdk-17-jdk-headless pkg-config tree wget imagemagick
 
-      - name: Checkout source code (tag)
+      - name: Checkout source code (tag ou commit)
         if: ${{ env.VERSION != 'master' }}
         uses: actions/checkout@v4
         with:
           repository: rustdesk/rustdesk
-          ref: refs/tags/${{ env.VERSION }}
+          # Sem o prefixo refs/tags/: o checkout aceita tag, branch ou SHA, e o
+          # default hoje e um commit (ver inputs.version).
+          ref: ${{ env.VERSION }}
           submodules: recursive
 
       - name: Checkout source code (master)
@@ -252,6 +262,23 @@ jobs:
         with:
           name: bridge-artifact
           path: ./
+
+      # O commit do vcpkg TEM que ser o baseline do vcpkg.json do RustDesk que
+      # esta sendo buildado: a 1.4.9 usa 120deac..., o 1ec1b9e usa 9e593bb...
+      # Com o commit errado o vcpkg nao acha as versoes pinadas e o build morre
+      # no 'Install vcpkg dependencies'. Lemos do proprio checkout em vez de
+      # fixar no env, pra trocar de tag/commit sem precisar lembrar disto.
+      - name: Baseline do vcpkg (segue o RustDesk buildado)
+        shell: bash
+        run: |
+          set -euo pipefail
+          b=$(grep -oE '"baseline"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' ./vcpkg.json | grep -oE '[0-9a-f]{40}' | head -1 || true)
+          if [ -z "$b" ]; then
+            echo "::error::baseline do vcpkg nao encontrado em ./vcpkg.json."
+            exit 1
+          fi
+          echo "VCPKG_BASELINE=$b" >> "$GITHUB_ENV"
+          echo "vcpkg baseline: $b"
 
       # ---------------------------------------------------------------------
       # BRANDING — subconjunto do build Windows que faz sentido em Android.
@@ -348,13 +375,16 @@ jobs:
         run: |
           set -euo pipefail
           f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
-          anchor='FFI.startServer(configPath, "")'
-          if ! grep -qF "$anchor" "$f"; then
-            echo "::error::ancora 'FFI.startServer(configPath, \"\")' nao encontrada em $f."
+          # O upstream mudou a assinatura em 31/08/2026 (d4b06a6): era
+          # startServer(configPath, "") e virou startServer(configPath, homePath, "").
+          # Aceitamos as duas; o que importa e o ULTIMO argumento, o custom.
+          re='FFI\.startServer\((configPath(, homePath)?), ""\)'
+          if ! grep -qE "$re" "$f"; then
+            echo "::error::chamada FFI.startServer(..., \"\") nao encontrada em $f."
             echo "::error::O RustDesk mudou o ponto de entrada do Android — revisar antes de seguir."
             exit 1
           fi
-          sed -i -e "s|FFI.startServer(configPath, \"\")|FFI.startServer(configPath, \"${{ env.custom }}\")|" "$f"
+          sed -i -E "s|${re}|FFI.startServer(\1, \"${{ env.custom }}\")|" "$f"
           echo "--- resultado ---"
           grep -n 'FFI.startServer' "$f"
 
@@ -399,8 +429,8 @@ jobs:
         run: |
           set -euo pipefail
           f=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
-          if grep -qF 'FFI.startServer(configPath, "")' "$f"; then
-            echo "::error::MainService.kt ainda passa string VAZIA — o APK sairia como RustDesk."
+          if grep -qE 'FFI\.startServer\([^)]*, ""\)' "$f"; then
+            echo "::error::MainService.kt ainda passa custom VAZIO ao startServer — o APK sairia como RustDesk."
             exit 1
           fi
           if ! grep -qF '${{ env.custom }}' "$f"; then
@@ -489,6 +519,11 @@ jobs:
           sed -i -e 's|<string name="app_name">RustDesk</string>|<string name="app_name">${{ env.appname }}</string>|' "$st"
           # descricao do servico de acessibilidade (cita "RustDesk" no meio da frase)
           sed -i -e 's|when RustDesk screen sharing|when ${{ env.appname }} screen sharing|' "$st"
+          # O 1ec1b9e trouxe uma string nova com "RustDesk": o subtipo do FGS
+          # specialUse (foreground_service_special_use_subtype), que o Android
+          # declara e a Play le na revisao. Troca geral no fim: tudo em
+          # strings.xml e texto visivel, e as ancoras acima ja provaram o formato.
+          sed -i -e 's|RustDesk|${{ env.appname }}|g' "$st"
 
           echo "--- resultado ---"
           cat "$st"
@@ -607,11 +642,32 @@ jobs:
           echo "--- resultado ---"
           grep -n 'createSurface()\|isStart antes da surface' "$f"
 
-      - name: removeNewVersionNotif
-        continue-on-error: true
+      # Sem aviso de "versao nova do RustDesk" e sem o app consultar
+      # api.rustdesk.com. Ate a 1.4.9 bastava apagar a URL do GitHub em
+      # common.rs; no 1ec1b9e a checagem passou a ir por
+      # hbb_common::version_check_request (api.rustdesk.com/version/latest) e o
+      # sed antigo virou no-op EM SILENCIO (tinha continue-on-error). Agora
+      # neutralizamos a funcao inteira, no mesmo padrao do load_custom_client
+      # (corpo + return), e o step falha se a ancora sumir.
+      - name: Sem checagem de versao nova (check_software_update)
         shell: bash
         run: |
-          sed -i -e 's|https://api.github.com/repos/rustdesk/rustdesk/releases/latest||' ./src/common.rs
+          set -euo pipefail
+          f=./src/common.rs
+          # URL antiga (<= 1.4.9); inofensivo se nao existir mais.
+          sed -i -e 's|https://api.github.com/repos/rustdesk/rustdesk/releases/latest||' "$f"
+          anchor='pub fn check_software_update() {'
+          if ! grep -qF "$anchor" "$f"; then
+            echo "::error::ancora '$anchor' nao encontrada em $f — RustDesk mudou a checagem de versao."
+            exit 1
+          fi
+          if grep -qF 'AcessoFast: sem checagem de versao' "$f"; then
+            echo "ja neutralizado, pulando."
+          else
+            sed -i -e 's|pub fn check_software_update() {|// AcessoFast: sem checagem de versao nova (injetado no CI)\n#[allow(unreachable_code)]\npub fn check_software_update() {\n    return;|' "$f"
+          fi
+          echo "--- resultado ---"
+          grep -n -A 3 'pub fn check_software_update' "$f"
 
       # SEM continue-on-error de proposito: no run #2 este step passou "verde" e
       # mesmo assim o aparelho mostrou o icone do RustDesk. Falha silenciosa de
@@ -768,6 +824,42 @@ jobs:
           fi
           echo "agente enganchado."
 
+      # DIVULGACAO + CONSENTIMENTO DA ACESSIBILIDADE (exigencia da Play Store).
+      # App que usa o AccessibilityService sem ser ferramenta de acessibilidade
+      # precisa, ANTES de o usuario ligar o servico, de uma tela no proprio app
+      # dizendo o que e acessado e pra que, com aceite explicito — e a Play pede
+      # um video disso na declaracao. O RustDesk tem um UNICO portao pra ligar o
+      # controle — showInputWarnAlert, chamado pelo toggleInput (nosso assistente
+      # E a tela do proprio RustDesk) —, mas o texto dele e generico. Trocamos o
+      # corpo por acessofastConsentimentoControle (mobile/onboarding.dart).
+      # Mesmo padrao do showScamWarning: corpo + return; o resto vira dead-code.
+      - name: Consentimento da Acessibilidade (Play)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/lib/models/server_model.dart
+          imp="import 'package:flutter_hbb/consts.dart';"
+          anchor='showInputWarnAlert(FFI ffi) {'
+          for a in "$imp" "$anchor"; do
+            if ! grep -qF "$a" "$f"; then
+              echo "::error::ancora nao encontrada em $f: $a"
+              echo "::error::O RustDesk mudou o server_model.dart — revisar o consentimento antes de publicar."
+              exit 1
+            fi
+          done
+          if grep -qF 'AcessoFast: consentimento da Acessibilidade' "$f"; then
+            echo "ja aplicado, pulando."
+          else
+            sed -i -e "s|$imp|$imp\nimport 'package:flutter_hbb/acessofast/onboarding.dart';|" "$f"
+            sed -i -e 's|showInputWarnAlert(FFI ffi) {|showInputWarnAlert(FFI ffi) {\n  // AcessoFast: consentimento da Acessibilidade (divulgacao exigida pela Play).\n  acessofastConsentimentoControle(ffi);\n  return;|' "$f"
+          fi
+          echo "--- resultado ---"
+          grep -n 'acessofast' "$f"
+          if ! grep -qF 'acessofastConsentimentoControle(ffi);' "$f"; then
+            echo "::error::o consentimento nao entrou no showInputWarnAlert."
+            exit 1
+          fi
+
       - name: Install flutter
         uses: subosito/flutter-action@v2
         with:
@@ -789,7 +881,7 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: /opt/artifacts/vcpkg
-          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          vcpkgGitCommitId: ${{ env.VCPKG_BASELINE }}
           doNotCache: false
 
       - name: Install vcpkg dependencies
@@ -899,13 +991,59 @@ jobs:
           # segunda copia do formato (livre pra divergir) e, num build que cruze a
           # meia-noite UTC, o .aab sairia com data diferente do .apk do mesmo commit.
           echo "AGENT_VERSION=${AGENT_VERSION}" >> "$GITHUB_ENV"
+
+          # versionCode. O pubspec do upstream fixa "1.4.9+67": sem isto todo
+          # build sai com o MESMO versionCode e a Play recusa o 2o envio. O
+          # run_number cresce a cada execucao DESTE workflow. O +3000 deixa acima
+          # dos APKs antigos, que com --split-per-abi sairam 2*1000+67 = 2067 —
+          # abaixo disso o aparelho recusa instalar por cima (downgrade).
+          # ATENCAO: renomear este arquivo zera o run_number; nesse caso subir o
+          # offset acima do ultimo versionCode publicado.
+          BUILD_NUMBER=$(( 3000 + ${{ github.run_number }} ))
+          echo "BUILD_NUMBER=${BUILD_NUMBER}" >> "$GITHUB_ENV"
+          echo "::notice::versionCode=${BUILD_NUMBER}"
+
+          # Nome dos arquivos: tag como esta; commit encurtado pra 7.
+          if [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]]; then LABEL="${VERSION:0:7}"; else LABEL="$VERSION"; fi
+          OUT_BASE="AcessoFast-${LABEL}-${{ matrix.job.arch }}"
+          echo "OUT_BASE=${OUT_BASE}" >> "$GITHUB_ENV"
+
+          # SEM --split-per-abi: com ele o Flutter reescreve o versionCode do APK
+          # (abi*1000 + build-number), e o APK sairia com numero MAIOR que o do
+          # .aab do mesmo build — um aparelho com o APK direto nunca mais
+          # aceitaria a atualizacao da Play. O --target-platform ja limita a arm64.
+          # ACESSOFAST_CANAL diz ao onboarding por onde o app foi instalado (o
+          # passo de "configuracoes restritas" so existe fora da Play).
           pushd flutter
-          flutter build apk --release --target-platform android-arm64 --split-per-abi \
-            --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}"
+          flutter build apk --release --target-platform android-arm64 \
+            --build-number="${BUILD_NUMBER}" \
+            --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}" \
+            --dart-define=ACESSOFAST_CANAL=apk
           popd
-          mv ./flutter/build/app/outputs/flutter-apk/app-${{ matrix.job.abi }}-release.apk \
-             ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
-          ls -la ./AcessoFast-*.apk
+          mv ./flutter/build/app/outputs/flutter-apk/app-release.apk "./${OUT_BASE}.apk"
+          ls -la "./${OUT_BASE}.apk"
+
+          # Confere o que foi EMPACOTADO (nao o que o gradle promete): pacote,
+          # versionCode e targetSdk. O targetSdk segue pro step do AAB, que falha
+          # se estiver abaixo do que a Play exige.
+          AAPT2=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name aapt2 -type f 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$AAPT2" ]; then
+            BADGING=$("$AAPT2" dump badging "./${OUT_BASE}.apk" 2>/dev/null | grep -E "^package:|^targetSdkVersion:" || true)
+            echo "$BADGING"
+            TARGET_SDK=$(echo "$BADGING" | grep -oE "targetSdkVersion:'[0-9]+'" | grep -oE '[0-9]+' || true)
+            echo "TARGET_SDK=${TARGET_SDK}" >> "$GITHUB_ENV"
+            echo "::notice::targetSdk=${TARGET_SDK:-?}"
+            if ! echo "$BADGING" | grep -qF "name='${{ env.applicationId }}'"; then
+              echo "::error::o APK nao saiu com o applicationId ${{ env.applicationId }}."
+              exit 1
+            fi
+            if ! echo "$BADGING" | grep -qF "versionCode='${BUILD_NUMBER}'"; then
+              echo "::error::o APK nao saiu com versionCode ${BUILD_NUMBER}."
+              exit 1
+            fi
+          else
+            echo "::warning::aapt2 nao encontrado — pacote/versionCode/targetSdk nao conferidos."
+          fi
 
       # AAB (Android App Bundle) — formato que a Play Store exige para publicar.
       # So roda quando 'gerar_aab' e marcado, pra nao dobrar o tempo dos builds de
@@ -935,13 +1073,26 @@ jobs:
             exit 1
           fi
           echo "::notice::agent_version(aab)=${AGENT_VERSION}"
+          # Mesmo versionCode do APK (via GITHUB_ENV). E a Play exige API 36
+          # desde 31/08/2026: melhor falhar aqui do que no upload.
+          if [ -z "${BUILD_NUMBER:-}" ]; then
+            echo "::error::BUILD_NUMBER vazio — o step do APK deveria te-lo exportado."
+            exit 1
+          fi
+          if [ -z "${TARGET_SDK:-}" ]; then
+            echo "::warning::targetSdk nao conferido (sem aapt2) — confira no Play Console."
+          elif [ "$TARGET_SDK" -lt 36 ]; then
+            echo "::error::targetSdk ${TARGET_SDK} — a Play Store recusa abaixo de 36. Buildar de um RustDesk que mire a API 36."
+            exit 1
+          fi
           pushd flutter
           flutter build appbundle --release --target-platform android-arm64 \
-            --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}"
+            --build-number="${BUILD_NUMBER}" \
+            --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}" \
+            --dart-define=ACESSOFAST_CANAL=play
           popd
-          mv ./flutter/build/app/outputs/bundle/release/app-release.aab \
-             ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.aab
-          ls -la ./AcessoFast-*.aab
+          mv ./flutter/build/app/outputs/bundle/release/app-release.aab "./${OUT_BASE}.aab"
+          ls -la "./${OUT_BASE}.aab"
 
       - name: Limpar segredos do workspace
         if: always()
@@ -954,7 +1105,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: acessofast-android-${{ matrix.job.arch }}
-          path: ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+          path: ./${{ env.OUT_BASE }}.apk
           if-no-files-found: error
 
       - name: Publicar o AAB AcessoFast como artefato (Play Store)
@@ -962,5 +1113,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: acessofast-android-${{ matrix.job.arch }}-aab
-          path: ./AcessoFast-${{ env.VERSION }}-${{ matrix.job.arch }}.aab
+          path: ./${{ env.OUT_BASE }}.aab
           if-no-files-found: error

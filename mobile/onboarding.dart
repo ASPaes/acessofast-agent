@@ -25,6 +25,13 @@
 // - Otimização de bateria entra como TEXTO, não botão: abrir aquela tela exige
 //   Intent nativo, e adicionar Kotlin aqui aumentaria o risco do build sem
 //   ganho proporcional. Fica para uma próxima, se doer na prática.
+// - O consentimento da Acessibilidade (acessofastConsentimentoControle) mora
+//   aqui, mas NÃO é chamado só pelo assistente: o CI troca o corpo do
+//   showInputWarnAlert do RustDesk por ele, então vale para todo caminho que
+//   liga o controle. É exigência da Play — ver o comentário da função.
+// - O canal de instalação vem do build (--dart-define=ACESSOFAST_CANAL): o
+//   .aab da Play sai com 'play', o APK direto com 'apk'. Não dá para ler o
+//   instalador em Dart sem Kotlin novo, e o build já sabe a resposta.
 
 import 'dart:async';
 import 'dart:convert';
@@ -32,9 +39,17 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/consts.dart';
+import 'package:flutter_hbb/models/model.dart';
 import 'package:path_provider/path_provider.dart';
 
 const String _onboardingFlagFile = 'acessofast_onboarding.done';
+
+/// true no .aab da Play Store. Instalado pela loja, o Android não aplica as
+/// "configurações restritas" (é o sideload que as ativa), então o passo de
+/// liberar some do assistente.
+const bool _viaPlayStore =
+    String.fromEnvironment('ACESSOFAST_CANAL') == 'play';
 
 void _log(String msg) {
   // ignore: avoid_print
@@ -105,6 +120,96 @@ Widget _step({
       ],
     ),
   );
+}
+
+Widget _itemConsentimento(String texto) => Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('•  ', style: TextStyle(fontSize: 12.5)),
+          Expanded(child: Text(texto, style: const TextStyle(fontSize: 12.5))),
+        ],
+      ),
+    );
+
+/// Divulgação + consentimento antes de abrir a Acessibilidade.
+///
+/// A Play exige isto de app que usa o AccessibilityService sem ser ferramenta
+/// de acessibilidade: a tela tem que estar no próprio app, no fluxo normal,
+/// dizer o que é acessado e para quê, e pedir aceite explícito (tocar em
+/// "Concordo"). A declaração no Play Console pede um vídeo deste diálogo.
+///
+/// Substitui o showInputWarnAlert do RustDesk (patch no CI), que é o único
+/// portão do toggleInput. "Agora não" fecha sem abrir nada.
+///
+/// O texto só afirma o que o app de fato faz: o serviço executa os toques e o
+/// texto que o técnico conectado envia. Mexer nele exige reler o InputService
+/// do RustDesk e regravar o vídeo da declaração.
+void acessofastConsentimentoControle(FFI ffi) {
+  ffi.dialogManager.show((setState, close, context) {
+    void concordo() {
+      try {
+        AndroidPermissionManager.startAction(kActionAccessibilitySettings);
+      } catch (e) {
+        _log('falha ao abrir acessibilidade: $e');
+      }
+      close();
+    }
+
+    return CustomAlertDialog(
+      title: const Text('Permitir o controle pelo técnico?'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'O AcessoFast usa o serviço de Acessibilidade do Android para que '
+              'o técnico que está te atendendo possa tocar, deslizar e digitar '
+              'na tela do seu celular por você.',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'Como esse acesso é usado:',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+            ),
+            _itemConsentimento(
+                'Só age durante um atendimento, quando um técnico autorizado '
+                'está conectado com a senha deste aparelho.'),
+            _itemConsentimento(
+                'Serve apenas para executar na tela os toques e o texto que o '
+                'técnico enviar. O AcessoFast não usa esse acesso para coletar, '
+                'guardar ou enviar dados seus.'),
+            _itemConsentimento(
+                'Você pode desligar quando quiser, em Configurações > '
+                'Acessibilidade > AcessoFast Input.'),
+            const SizedBox(height: 10),
+            const Text(
+              'Ao tocar em "Concordo", abriremos as configurações de '
+              'Acessibilidade para você ativar "AcessoFast Input".',
+              style: TextStyle(fontSize: 12.5),
+            ),
+            if (!_viaPlayStore) ...[
+              const SizedBox(height: 8),
+              const Text(
+                'Se a opção aparecer acinzentada, antes libere em Informações '
+                'do aplicativo > ⋮ > "Permitir configurações restritas".',
+                style: TextStyle(fontSize: 12),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: close, child: const Text('Agora não')),
+        TextButton(onPressed: concordo, child: const Text('Concordo')),
+      ],
+      onSubmit: concordo,
+      onCancel: close,
+    );
+  });
 }
 
 /// Mostra o assistente. `forcar: true` ignora a marca de já exibido — usado
@@ -185,37 +290,40 @@ Future<void> showAcessofastOnboarding({bool forcar = false}) async {
               // Os dois passos só ficam verdes quando o input REALMENTE liga
               // (sm.inputOk) — que é a única prova confiável de que a restrição
               // foi liberada. Assim o botão "Liberar" continua disponível caso
-              // o cliente erre o caminho e precise voltar. Quando o app vier da
-              // Play Store este passo 3 deixa de ser necessário (sideload é o
-              // que ativa a restrição) — reavaliar lá.
+              // o cliente erre o caminho e precise voltar. Instalado pela Play
+              // Store o passo 3 não existe (sideload é o que ativa a restrição),
+              // então ele some e o "Ativar" vira o passo 3.
+              if (!_viaPlayStore)
+                _step(
+                  n: 3,
+                  titulo: 'Liberar o controle',
+                  descricao:
+                      'Como o app foi instalado fora da Play Store, o Android '
+                      'tranca o próximo passo até você liberar. Vai abrir '
+                      '"Informações do aplicativo" — toque em "Permitir '
+                      'configurações restritas" (no topo; em alguns aparelhos, no '
+                      'menu ⋮ do canto).',
+                  ok: sm.inputOk,
+                  acao: 'Liberar',
+                  onTap: () async {
+                    try {
+                      AndroidPermissionManager.startAction(
+                          'android.settings.APPLICATION_DETAILS_SETTINGS');
+                    } catch (e) {
+                      _log('falha ao abrir Informações do aplicativo: $e');
+                    }
+                    setState(() {});
+                  },
+                ),
               _step(
-                n: 3,
-                titulo: 'Liberar o controle',
-                descricao:
-                    'Como o app foi instalado fora da Play Store, o Android '
-                    'tranca o próximo passo até você liberar. Vai abrir '
-                    '"Informações do aplicativo" — toque em "Permitir '
-                    'configurações restritas" (no topo; em alguns aparelhos, no '
-                    'menu ⋮ do canto).',
-                ok: sm.inputOk,
-                acao: 'Liberar',
-                onTap: () async {
-                  try {
-                    AndroidPermissionManager.startAction(
-                        'android.settings.APPLICATION_DETAILS_SETTINGS');
-                  } catch (e) {
-                    _log('falha ao abrir Informações do aplicativo: $e');
-                  }
-                  setState(() {});
-                },
-              ),
-              _step(
-                n: 4,
+                n: _viaPlayStore ? 3 : 4,
                 titulo: 'Ativar o controle',
-                descricao:
-                    'Deixa o técnico tocar na tela por você, em vez de só olhar. '
-                    'Abre a Acessibilidade — ative "AcessoFast Input". Se a opção '
-                    'estiver acinzentada, volte ao passo 3.',
+                descricao: _viaPlayStore
+                    ? 'Deixa o técnico tocar na tela por você, em vez de só '
+                        'olhar. Abre a Acessibilidade — ative "AcessoFast Input".'
+                    : 'Deixa o técnico tocar na tela por você, em vez de só '
+                        'olhar. Abre a Acessibilidade — ative "AcessoFast Input". '
+                        'Se a opção estiver acinzentada, volte ao passo 3.',
                 ok: sm.inputOk,
                 onTap: () async {
                   try {
