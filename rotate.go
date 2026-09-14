@@ -121,11 +121,23 @@ func applyPassword(exe, pw string) error {
 	return nil
 }
 
-// reportRotation POSTa a senha nova ao painel. true SO em HTTP 200.
-func reportRotation(pw string) bool {
-	payload, _ := json.Marshal(map[string]string{
+// payloadRotacao monta o corpo do reporte. pedido_id so vai quando a senha veio de um
+// pedido do painel (senha_painel.go): e o que faz o rotate-device-secret apagar o
+// pedido na mesma transacao em que grava a senha. Rotacao comum manda o corpo de sempre.
+func payloadRotacao(pw, pedidoID string) []byte {
+	m := map[string]string{
 		"rustdesk_id": rustdeskID, "agent_token": token, "password": pw,
-	})
+	}
+	if pedidoID != "" {
+		m["pedido_id"] = pedidoID
+	}
+	payload, _ := json.Marshal(m)
+	return payload
+}
+
+// reportRotation POSTa a senha nova ao painel. true SO em HTTP 200.
+func reportRotation(pw, pedidoID string) bool {
+	payload := payloadRotacao(pw, pedidoID)
 	req, err := http.NewRequest("POST", rotateURL, bytes.NewReader(payload))
 	if err != nil {
 		logln("ROTATE report erro ao montar req: %v", err)
@@ -161,7 +173,14 @@ func writePending(pw string) error {
 }
 
 func readPending() string { return readTrim(pendingFile) }
-func clearPending()       { _ = os.Remove(pendingFile) }
+
+// clearPending apaga a pendencia E o pedido_id que a acompanha (senha_painel.go): os
+// dois descrevem a mesma senha, e um pedido_id sobrando seria anexado a proxima
+// pendencia, que e de outra senha.
+func clearPending() {
+	_ = os.Remove(pendingFile)
+	clearPedido()
+}
 
 // clienteVivo: o servico do cliente branded esta rodando? clientProcPID e por
 // plataforma (SCM no Windows, launchd no macOS) e ja devolve false para leitura
@@ -235,12 +254,16 @@ func rotateNow() {
 
 	// 2) a senha nova JA esta no endpoint -> registra a pendencia antes de reportar,
 	//    pra sobreviver a crash/queda de rede entre aplicar e confirmar.
+	//    Passo 2: esta senha e sorteada, nao pedida — um senha.pedido sobrando de uma
+	//    senha do painel ainda nao confirmada NAO pode ir junto com ela. O pedido segue
+	//    no servidor e volta no proximo presence.
+	clearPedido()
 	if err := writePending(pw); err != nil {
 		logln("ROTATE WARN: nao persistiu pendencia: %v (seguindo com envio em memoria)", err)
 	}
 
 	// 3) reporta; sucesso -> limpa a pendencia. Falha -> o retry loop reenvia.
-	if reportRotation(pw) {
+	if reportRotation(pw, "") {
 		clearPending()
 		logln("ROTATE ok: senha rotacionada e confirmada pelo painel")
 	} else {
@@ -372,7 +395,9 @@ func flushPending() bool {
 	if pw == "" {
 		return true
 	}
-	if reportRotation(pw) {
+	// Passo 2: se a pendencia e de uma senha pedida pelo painel, o pedido_id vai junto
+	// — senao o painel guardaria a senha mas o pedido ficaria aberto ate expirar.
+	if reportRotation(pw, readPedido()) {
 		clearPending()
 		logln("ROTATE pendencia confirmada pelo painel")
 		return true

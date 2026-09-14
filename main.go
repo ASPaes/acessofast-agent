@@ -286,6 +286,9 @@ type ingestResp struct {
 	// (servidor antigo, falha na resolucao) = o agente mantem o que tem em cache. Ver
 	// rotacao_modo.go.
 	Rotacao string `json:"rotacao"`
+	// Passo 2: senha definida no painel e ainda nao aplicada nesta maquina. So vem no
+	// 'presence', e volta a cada presence ate o agente confirmar. Ver senha_painel.go.
+	Senha *senhaDoPainel `json:"senha"`
 }
 
 type avisoServidor struct {
@@ -354,11 +357,9 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 
 	// O log segue truncado em 400: quem le agent.log quer ver o ok/erro, e despejar
 	// a assinatura inteira a cada 60s so inchava o arquivo na maquina do cliente.
-	logged := strings.TrimSpace(string(body))
-	if len(logged) > 400 {
-		logged = logged[:400] + "…"
-	}
-	logln("POST %s -> HTTP %d  %s", event, resp.StatusCode, logged)
+	// Passo 2: e a resposta pode trazer a senha pedida pelo painel, que nao pode
+	// cair em texto claro no agent.log — corpoParaLog omite e trunca.
+	logln("POST %s -> HTTP %d  %s", event, resp.StatusCode, corpoParaLog(body))
 
 	var r ingestResp
 	if json.Unmarshal(body, &r) != nil {
@@ -390,6 +391,13 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 	// trata-lo assim faria uma falha transitoria do servidor religar a rotacao.
 	if r.Rotacao != "" {
 		gravaModoRotacao(r.Rotacao)
+	}
+
+	// Passo 2: senha definida no painel. Inline e depois do modo: so vem no presence
+	// (maquina ociosa), e o postEventFull do presence roda antes do aplicaUpdate — se
+	// os dois vierem juntos, a senha e aplicada e confirmada antes de o servico reiniciar.
+	if r.Senha != nil {
+		aplicaSenhaDoPainel(r.Senha)
 	}
 
 	return cap, r.Update
