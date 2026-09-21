@@ -999,7 +999,13 @@ jobs:
           # abaixo disso o aparelho recusa instalar por cima (downgrade).
           # ATENCAO: renomear este arquivo zera o run_number; nesse caso subir o
           # offset acima do ultimo versionCode publicado.
-          BUILD_NUMBER=$(( 3000 + ${{ github.run_number }} ))
+          # O run_attempt entra porque "Re-run jobs" NAO incrementa o run_number:
+          # em 21/09/2026 duas builds sairam com 3012 e a Play recusou a segunda
+          # ("o codigo de versao 3012 ja foi usado"). Multiplicar o run_number por
+          # 10 abre espaco para ate 10 tentativas por execucao e mantem a ordem
+          # crescente: run 13 tentativa 1 = 3130, tentativa 2 = 3131, run 14 = 3140.
+          # Fica acima dos 3012 e 2067 que ja existem.
+          BUILD_NUMBER=$(( 3000 + ${{ github.run_number }} * 10 + ${{ github.run_attempt }} - 1 ))
           echo "BUILD_NUMBER=${BUILD_NUMBER}" >> "$GITHUB_ENV"
           echo "::notice::versionCode=${BUILD_NUMBER}"
 
