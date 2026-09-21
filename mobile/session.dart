@@ -423,6 +423,29 @@ DateTime _lastRetry = DateTime.fromMillisecondsSinceEpoch(0);
 // em disco; esta flag so poupa I/O dentro do mesmo processo).
 bool _initialSyncChecked = false;
 
+/// A marca so vale quando o painel CONFIRMOU a senha.
+///
+/// Marca antiga (`{"done":true}`, gravada por build anterior a 21/09/2026) nao
+/// prova nada: ela era escrita mesmo quando o servidor DESCARTAVA o reporte. Foi
+/// o que travou o aparelho `1259011677` em 21/09/2026 — matricula aquietada pelo
+/// quiesce (o nonce no disco tinha 48 dias), senha publicada antes de existir
+/// cadastro, descartada, e marcada como feita. Adotado depois, o painel ficava
+/// preso em "Preparando o primeiro acesso" para sempre.
+///
+/// Sem `confirmado: true` a sincronizacao roda de novo. Custa UMA rotacao por
+/// aparelho ao atualizar o app, e em troca todo celular nesse estado se
+/// conserta sozinho — sem reinstalar e sem mexer no banco.
+Future<bool> _syncConfirmado(File f) async {
+  try {
+    if (!await f.exists()) return false;
+    final j = jsonDecode(await f.readAsString());
+    return j is Map && j['confirmado'] == true;
+  } catch (_) {
+    // marca ilegivel: trata como nao confirmada e sincroniza de novo
+    return false;
+  }
+}
+
 /// Sincroniza a senha permanente com o painel UMA VEZ, logo apos a matricula.
 ///
 /// Sem isto, no 1o acesso o painel serve a senha provisionada que o aparelho
@@ -442,7 +465,7 @@ Future<void> _maybeInitialSync() async {
   if (_cadastrado == false) return;
   try {
     final f = await _file(_pwSyncFlagFile);
-    if (await f.exists()) {
+    if (await _syncConfirmado(f)) {
       _initialSyncChecked = true;
       return;
     }
@@ -457,9 +480,15 @@ Future<void> _maybeInitialSync() async {
     // Descartado: o painel NAO tem a senha. _senhaDescartada ja armou a espera
     // pelo cadastro; gravar a marca aqui travaria o "Conectar" do painel.
     if (rep == _Reporte.descartado) return;
-    // Gravado, ou falhou na rede (a pendencia entrega depois): sincronizado.
+    if (rep == _Reporte.gravado) {
+      _initialSyncChecked = true;
+      await f.writeAsString(
+          jsonEncode({'done': true, 'confirmado': true}), flush: true);
+      return;
+    }
+    // Falhou na rede: a pendencia entrega depois. NAO grava a marca — se o
+    // reporte nunca chegar, a proxima abertura do app tenta de novo.
     _initialSyncChecked = true;
-    await f.writeAsString(jsonEncode({'done': true}), flush: true);
   } catch (e) {
     _log('sync inicial da senha falhou: $e (tentara de novo)');
   }
