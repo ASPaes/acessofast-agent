@@ -47,7 +47,22 @@ const (
 	ingestURL         = "https://plmfyibyrowbgjjyblcl.supabase.co/functions/v1/session-ingest"
 	pollInterval      = 3 * time.Second
 	heartbeatInterval = 20 * time.Second
-	presenceInterval  = 60 * time.Second
+
+	// presenceInterval — batimento da maquina OCIOSA, e a maior fonte de invocacao
+	// do projeto inteiro. Medido em 26/08/2026: a session-ingest fez 130.402
+	// chamadas em 24h (49% de tudo), praticamente todas 'presence' de ~105 maquinas
+	// ligadas. A 60s cada maquina custava 1.440/dia; a 180s custa 480.
+	//
+	// Nao mexemos no heartbeatInterval de proposito: ele so bate DURANTE sessao, e
+	// sessao e evento raro (~450/mes). O custo esta na maquina parada, nao na ocupada.
+	//
+	// ACOPLAMENTO (nao afrouxar sem ler): o painel deriva online/offline de
+	// address_book.last_online, carimbado justamente por este evento. Se a janela do
+	// painel for menor que esta cadencia, a frota inteira pisca offline. A janela
+	// vive em src/lib/presenca.ts (JANELA_ONLINE_MS) do repo do painel, hoje em 7min,
+	// e PRECISA estar publicada antes deste agente sair. Alargar a janela e
+	// compativel com agente antigo; encurtar depois nao e.
+	presenceInterval = 180 * time.Second
 
 	// Fase 3 §3.1 — janela de carencia (debounce) do fim de sessao. Ao esvaziar o
 	// conjunto de #N, NAO encerra/rotaciona na hora: espera este prazo por uma
@@ -137,6 +152,55 @@ func readTrim(path string) string {
 	return strings.TrimSpace(string(b))
 }
 
+// revalidaRustdeskID — o CLIENTE e a autoridade sobre o proprio ID; o arquivo em
+// ProgramData e cache do instalador, e cache fica velho.
+//
+// O BUG QUE ISTO FECHA (medido em 26-28/08/2026): reinstalar o cliente sorteia um ID
+// NOVO, mas ninguem reescreve o cache em ProgramData — e o bootstrap.ps1
+// nao toca nesse diretorio de proposito, pra nao rematricular. Como discoverRustdeskID()
+// devolve o arquivo ANTES de perguntar ao cliente, e waitForRustDeskID() chama
+// discoverRustdeskID() primeiro, o agente passa a viver sob um ID MORTO: a session-ingest
+// responde 404, a matricula abre claim atras de claim sob um ID que nenhum humano
+// consegue casar com maquina nenhuma, e nasce um zumbi que polla claim-status a cada 15s
+// pra sempre. Rejeitar ou expirar a claim nao adianta — o agente re-registra. Resultado
+// medido: 5.910 claims expiradas e claim-status em 122.764 invocacoes/dia, 46% de tudo.
+//
+// Regra: se o cliente responder um ID valido e DIFERENTE do arquivo, o cliente vence.
+// Reescreve o cache e descarta o token — ele foi emitido pro device antigo e nao vale
+// nada sob o ID novo. O proximo passo do worker cai em MODO MATRICULA e se matricula
+// sob o ID certo, que ai e adotavel.
+//
+// Fail-safe em toda saida: cliente ausente, --get-id falhando ou ID igual => NAO mexe em
+// nada. Identidade so troca com resposta positiva e bem formada do cliente (getRustDeskID
+// ja valida o formato e tenta por ate 90s). Na duvida, mantem o que esta.
+//
+// Roda UMA vez, no startup, antes de ler o token — nao dentro do laco de matricula, pra
+// nao pagar um exec a cada 15s.
+func revalidaRustdeskID() {
+	guardado := readTrim(ridFile)
+	if guardado == "" {
+		return // sem cache: o fluxo normal ja pergunta ao cliente
+	}
+	exe, err := findRustDeskExe()
+	if err != nil {
+		return // cliente nao instalado: nao ha a quem perguntar
+	}
+	atual, err := getRustDeskID(exe)
+	if err != nil || atual == "" || atual == guardado {
+		return
+	}
+	logln("ID DIVERGENTE: arquivo=%s, cliente=%s -> o cliente vence (cliente reinstalado)", guardado, atual)
+	if err := os.WriteFile(ridFile, []byte(atual), 0o600); err != nil {
+		logln("ID: falha ao regravar %s: %v -- mantendo %s", ridFile, err, guardado)
+		return
+	}
+	_ = hardenDir(baseDir)
+	if readTrim(tokenFile) != "" {
+		_ = os.Remove(tokenFile)
+		logln("ID: token descartado (era do device %s) -> rematricula sob %s", guardado, atual)
+	}
+}
+
 // Descobre o rustdesk_id: arquivo dedicado (autoridade do instalador) ou, fallback,
 // varre a config do cliente branded procurando o campo id. Namespace = AcessoFast
 // (confirmado em maquina real: ...\AcessoFast\config\AcessoFast2.toml).
@@ -199,6 +263,32 @@ type ingestResp struct {
 	// quando o alvo resolvido no servidor difere da versao que este agente reportou.
 	// Ver update.go.
 	Update *updateInfo `json:"update"`
+	// Aviso para MOSTRAR NA TELA desta maquina. Hoje ha um caso: o operador
+	// acessou, direto pelo cliente, um computador cujo AcessoFast esta velho
+	// demais para se atualizar sozinho.
+	//
+	// Por que o aviso chega AQUI e nao na maquina acessada: quem desenharia a
+	// janela la seria o agente dela — e e justamente o desatualizado. Entao o
+	// servidor identifica o operador pelo controller_rustdesk_id que a maquina
+	// acessada reporta no 'start', e devolve o aviso no presence DELE.
+	//
+	// O texto vem pronto do servidor de proposito: melhorar a redacao nao pode
+	// exigir rollout de binario na frota inteira.
+	Aviso *avisoServidor `json:"aviso"`
+	// Passo 1 (Aposentar a senha rotativa): modo de rotacao resolvido no servidor em
+	// cascata device -> tenant -> global. So vem no 'presence', e SEMPRE vem — mesmo
+	// quando e 'session' — senao reverter o canario nunca chegaria ao agente. Ausente
+	// (servidor antigo, falha na resolucao) = o agente mantem o que tem em cache. Ver
+	// rotacao_modo.go.
+	Rotacao string `json:"rotacao"`
+	// Passo 2: senha definida no painel e ainda nao aplicada nesta maquina. So vem no
+	// 'presence', e volta a cada presence ate o agente confirmar. Ver senha_painel.go.
+	Senha *senhaDoPainel `json:"senha"`
+}
+
+type avisoServidor struct {
+	Titulo   string `json:"titulo"`
+	Mensagem string `json:"mensagem"`
 }
 
 // postEvent posta um evento de sessao e devolve o hard_cap_at da resposta (zero se
@@ -227,6 +317,10 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 		// 1 min, sem nenhuma requisicao nova. O servidor grava em
 		// address_book.agent_version.
 		"agent_version": version,
+		// Passo 1: o modo que este agente esta APLICANDO de fato. O servidor grava em
+		// address_book.rotacao_modo_efetivo — e o par de rotacao_modo como agent_version
+		// e de agent_target_version: e o que prova, no canario, que a maquina obedece.
+		"rotacao_modo": modoRotacao(),
 	}
 	// controller_rustdesk_id (auto-adocao): rustdesk_id do peer (controlador), quando
 	// conhecido. So no 'start' serve de gatilho pro servidor auto-adotar um device ainda
@@ -258,11 +352,9 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 
 	// O log segue truncado em 400: quem le agent.log quer ver o ok/erro, e despejar
 	// a assinatura inteira a cada 60s so inchava o arquivo na maquina do cliente.
-	logged := strings.TrimSpace(string(body))
-	if len(logged) > 400 {
-		logged = logged[:400] + "…"
-	}
-	logln("POST %s -> HTTP %d  %s", event, resp.StatusCode, logged)
+	// Passo 2: e a resposta pode trazer a senha pedida pelo painel, que nao pode
+	// cair em texto claro no agent.log — corpoParaLog omite e trunca.
+	logln("POST %s -> HTTP %d  %s", event, resp.StatusCode, corpoParaLog(body))
 
 	var r ingestResp
 	if json.Unmarshal(body, &r) != nil {
@@ -280,6 +372,29 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 			logln("WARN hard_cap_at ilegivel: %q", r.HardCapAt)
 		}
 	}
+
+	// Recado do servidor para a tela desta maquina (ver aviso.go). Tratado aqui e
+	// nao devolvido ao chamador de proposito: e efeito colateral da resposta, nao
+	// um valor que start/heartbeat/end precisem conhecer — devolver mudaria a
+	// assinatura de uma funcao com varios chamadores para nada.
+	if r.Aviso != nil {
+		mostraAviso(r.Aviso)
+	}
+
+	// Passo 1: modo de rotacao do servidor. Mesmo raciocinio do aviso — efeito
+	// colateral da resposta. So atualiza quando veio: campo ausente NAO e "session", e
+	// trata-lo assim faria uma falha transitoria do servidor religar a rotacao.
+	if r.Rotacao != "" {
+		gravaModoRotacao(r.Rotacao)
+	}
+
+	// Passo 2: senha definida no painel. Inline e depois do modo: so vem no presence
+	// (maquina ociosa), e o postEventFull do presence roda antes do aplicaUpdate — se
+	// os dois vierem juntos, a senha e aplicada e confirmada antes de o servico reiniciar.
+	if r.Senha != nil {
+		aplicaSenhaDoPainel(r.Senha)
+	}
+
 	return cap, r.Update
 }
 
@@ -372,6 +487,11 @@ func (t *tailer) rotacionarSeAutenticada(motivo string) {
 	t.autenticada = false
 	if !autenticada {
 		logln("ROTATE suprimido (%s): nenhuma conexao autenticou — senha do painel mantida", motivo)
+		return
+	}
+	// Passo 1: fim de sessao e ROTINA — o modo decide. A marca da sessao ja foi limpa
+	// acima, entao suprimir aqui nao deixa estado vazando para a proxima.
+	if !podeRotacionar(gatilhoFimSessao) {
 		return
 	}
 	// Em goroutine: faz exec (--password) + HTTP e nao pode bloquear o poll de deteccao.
@@ -735,6 +855,9 @@ func (t *tailer) poll() {
 
 func worker(stop <-chan struct{}) {
 	logln("===== AcessoFast agent iniciado =====")
+	// ANTES de ler o token: se o cliente foi reinstalado, o ID mudou e o token velho
+	// nao vale mais. Ver revalidaRustdeskID.
+	revalidaRustdeskID()
 	token = readTrim(tokenFile)
 	if token == "" {
 		logln("sem token em %s -> MODO MATRICULA (tailer ativo p/ auto-adocao)", tokenFile)

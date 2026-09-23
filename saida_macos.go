@@ -165,3 +165,44 @@ func temArgumento(argumentos []string, alvo string) bool {
 	}
 	return false
 }
+
+// parseMapaDePais interpreta a saida de `ps -axo pid=,ppid=` e devolve filho -> pai,
+// que e o que descendentesDe (sessao_socket.go) precisa pra caminhar a arvore.
+//
+// Existe pelo mesmo motivo do resto deste arquivo: a REGRA de caminhada ja tem teste
+// no lado comum, e o parse — onde da pra errar em silencio — passa a ter tambem.
+func parseMapaDePais(saidaPs string) map[uint32]uint32 {
+	pais := make(map[uint32]uint32, 256)
+	for _, linha := range strings.Split(saidaPs, "\n") {
+		campos := strings.Fields(linha)
+		if len(campos) < 2 {
+			continue
+		}
+		pid, err1 := strconv.ParseUint(campos[0], 10, 32)
+		ppid, err2 := strconv.ParseUint(campos[1], 10, 32)
+		if err1 != nil || err2 != nil || pid == 0 {
+			continue
+		}
+		pais[uint32(pid)] = uint32(ppid)
+	}
+	return pais
+}
+
+// citaAppleScript transforma um texto em literal de string do AppleScript.
+//
+// ISTO E FRONTEIRA DE CONFIANCA, nao formatacao. A mensagem do aviso vem do
+// SERVIDOR e vai para dentro de um script que roda como o usuario logado. Texto com
+// aspas nao escapadas FECHARIA o literal, e o que viesse depois seria executado
+// como codigo — e o macOS deixa o AppleScript chamar `do shell script`.
+//
+// A ordem importa: a barra invertida primeiro, senao a escapada da aspa seria
+// escapada de novo e o literal quebraria de outro jeito. Quebra de linha vira a
+// sequencia \n, porque literal do AppleScript nao aceita linha crua no meio.
+func citaAppleScript(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\r\n", `\n`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\n`)
+	return `"` + s + `"`
+}

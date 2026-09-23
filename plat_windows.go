@@ -310,9 +310,33 @@ func tabelaTCP(family uintptr) ([]byte, bool) {
 	return nil, false
 }
 
-// socketsDeSessao conta os TCP ESTABLISHED do PID que NAO sao o vinculo do rendezvous.
-// (0, false) = leitura falhou; o chamador nao age nesse caso (fail-safe).
-func socketsDeSessao(pid uint32) (int, bool) {
+// mapaDePais le o snapshot de processos do sistema e devolve filho -> pai.
+// (nil, false) quando o snapshot falha: o chamador nao age nesse caso.
+func mapaDePais() (map[uint32]uint32, bool) {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil, false
+	}
+	defer windows.CloseHandle(snap)
+
+	var e windows.ProcessEntry32
+	e.Size = uint32(unsafe.Sizeof(e))
+	if err := windows.Process32First(snap, &e); err != nil {
+		return nil, false
+	}
+	pais := make(map[uint32]uint32, 256)
+	for {
+		pais[e.ProcessID] = e.ParentProcessID
+		if err := windows.Process32Next(snap, &e); err != nil {
+			break // ERROR_NO_MORE_FILES: fim da lista
+		}
+	}
+	return pais, true
+}
+
+// socketsDeSessao conta os TCP ESTABLISHED dos PIDs dados que NAO sao o vinculo do
+// rendezvous. (0, false) = leitura falhou; o chamador nao age nesse caso (fail-safe).
+func socketsDeSessao(pids map[uint32]bool) (int, bool) {
 	total := 0
 	for _, fam := range []uintptr{afInet, afInet6} {
 		buf, ok := tabelaTCP(fam)
@@ -341,7 +365,7 @@ func socketsDeSessao(pid uint32) (int, bool) {
 				r := (*mibTCP6RowOwnerPID)(p)
 				estado, remota, dono = r.State, r.RemotePort, r.OwningPID
 			}
-			if dono != pid || estado != mibTCPStateEstab {
+			if !pids[dono] || estado != mibTCPStateEstab {
 				continue
 			}
 			switch portaDe(remota) {
@@ -432,4 +456,66 @@ func runAgent() {
 	if err := svc.Run(serviceName, &service{}); err != nil {
 		logln("svc.Run erro: %v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Aviso na tela de quem esta usando a maquina
+// ---------------------------------------------------------------------------
+
+const (
+	// MB_OK | MB_ICONWARNING | MB_SETFOREGROUND: um botao, icone de atencao, e a
+	// janela vem para a frente. O operador esta olhando a sessao remota em tela
+	// cheia; sem SETFOREGROUND o aviso nasceria atras dela.
+	mbEstilo = 0x00000000 | 0x00000030 | 0x00010000
+
+	// WTS_CURRENT_SERVER_HANDLE e 0 — a maquina local.
+	wtsCurrentServer = 0
+)
+
+var (
+	wtsapi32           = windows.NewLazySystemDLL("wtsapi32.dll")
+	procWTSSendMessage = wtsapi32.NewProc("WTSSendMessageW")
+)
+
+// entregaAviso poe o recado na sessao interativa. A regra de quando mostrar vive em
+// aviso.go, que tambem explica por que WTSSendMessage e nao msg.exe: o msg.exe nao
+// existe nas edicoes Home do Windows, que e o que mais se acha em maquina de
+// operador — o aviso nunca apareceria, e falharia calado.
+func entregaAviso(titulo, mensagem string) {
+	sessao := windows.WTSGetActiveConsoleSessionId()
+	if sessao == 0xFFFFFFFF {
+		// Ninguem logado no console (tela de bloqueio, ou maquina sem sessao).
+		// O aviso volta no proximo presence: a supressao de 15 min expira
+		// sozinha e o servidor so marca como entregue o que ja devolveu.
+		logln("aviso nao exibido: nenhuma sessao interativa no momento")
+		return
+	}
+
+	// UTF16FromString devolve o slice COM o terminador; o tamanho pedido pela
+	// API e em bytes e SEM ele, dai o -1 antes de dobrar.
+	tit, e1 := windows.UTF16FromString(titulo)
+	msg, e2 := windows.UTF16FromString(mensagem)
+	if e1 != nil || e2 != nil {
+		logln("aviso nao exibido: texto invalido")
+		return
+	}
+
+	var resposta uint32
+	ret, _, errno := procWTSSendMessage.Call(
+		uintptr(wtsCurrentServer),
+		uintptr(sessao),
+		uintptr(unsafe.Pointer(&tit[0])),
+		uintptr((len(tit)-1)*2),
+		uintptr(unsafe.Pointer(&msg[0])),
+		uintptr((len(msg)-1)*2),
+		uintptr(mbEstilo),
+		uintptr(int(avisoTempoTela.Seconds())),
+		uintptr(unsafe.Pointer(&resposta)),
+		0, // bWait = FALSE: nao trava esperando o clique
+	)
+	if ret == 0 {
+		logln("aviso NAO exibido (WTSSendMessage): %v", errno)
+		return
+	}
+	logln("aviso exibido na tela (sessao %d): %s", sessao, titulo)
 }

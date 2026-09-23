@@ -356,39 +356,6 @@ func uidDoConsole() (int, bool) {
 // Sockets de sessao do cliente branded (equivalente do GetExtendedTcpTable)
 // ---------------------------------------------------------------------------
 
-// socketsDeSessao conta os TCP ESTABLISHED do PID que NAO sao o vinculo do
-// rendezvous. (0, false) = leitura falhou; o chamador nao age nesse caso (fail-safe).
-//
-// lsof no lugar da tabela do kernel: o macOS nao expoe nada como o GetExtendedTcpTable,
-// e netstat no macOS NAO mostra o dono do socket. O -F devolve saida por campo (uma
-// letra por linha), que e estavel entre versoes — bem mais seguro de parsear do que a
-// tabela humana do lsof.
-func socketsDeSessao(pid uint32) (int, bool) {
-	out, err := exec.Command("lsof",
-		"-nP", // sem resolver DNS nem nome de porta (rapido e estavel)
-		"-a",  // combina os filtros abaixo em E, nao em OU
-		"-p", strconv.FormatUint(uint64(pid), 10),
-		"-iTCP", "-sTCP:ESTABLISHED",
-		"-Fn", // so o campo de nome (endereco), uma linha por socket
-	).Output()
-	if err != nil {
-		// lsof sai com 1 quando NAO ha nenhum socket casando o filtro — e o caso
-		// legitimo de maquina ociosa, nao uma falha de leitura. Distinguimos pelo
-		// exit code: 1 com saida vazia = zero sockets; qualquer outra coisa = nao
-		// conseguimos ler, e ai o chamador nao pode agir.
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 && len(out) == 0 {
-			return 0, true
-		}
-		return 0, false
-	}
-
-	// A CONTAGEM vive em saida_macos.go, de proposito SEM build tag. E a parte que
-	// erra EM SILENCIO — um socket a mais e a sessao nunca termina (fantasma), um a
-	// menos e a sessao de quem esta trabalhando cai. Fora da tag, ela tem teste
-	// rodando em qualquer maquina; sob a tag, so num Mac.
-	return contaSocketsSessao(string(out)), true
-}
-
 // ---------------------------------------------------------------------------
 // Auto-update: restart do proprio daemon
 // ---------------------------------------------------------------------------
@@ -442,4 +409,90 @@ func runAgent() {
 	}()
 
 	worker(stop)
+}
+
+// ---------------------------------------------------------------------------
+// Aviso na tela de quem esta usando a maquina
+// ---------------------------------------------------------------------------
+
+// modeloDialogo: o dialogo do macOS. "giving up after" fecha sozinho no prazo — sem
+// isso um aviso que ninguem responde deixaria um osascript vivo para sempre.
+const modeloDialogo = `display dialog %s with title %s buttons {"OK"} default button "OK" with icon caution giving up after %d`
+
+// entregaAviso mostra o recado na sessao grafica do usuario. A regra de quando
+// mostrar vive em aviso.go; aqui e so a entrega.
+//
+// O launchctl asuser nao e detalhe: o agente roda como root, FORA de qualquer sessao
+// grafica, e um osascript disparado direto dali nao apareceria na tela de ninguem.
+// O asuser injeta o comando na sessao do usuario do console — e o equivalente do que
+// o WTSSendMessage faz no Windows.
+func entregaAviso(titulo, mensagem string) {
+	uid, ok := uidDoConsole()
+	if !ok {
+		logln("aviso nao exibido: nenhuma sessao grafica no momento")
+		return
+	}
+
+	// citaAppleScript NAO e frescura: a mensagem vem do SERVIDOR. Texto com aspas
+	// nao escapadas fecharia o literal e o resto viraria CODIGO AppleScript rodando
+	// como o usuario logado. Ver o teste em saida_macos_test.go.
+	script := fmt.Sprintf(modeloDialogo,
+		citaAppleScript(mensagem), citaAppleScript(titulo), int(avisoTempoTela.Seconds()))
+
+	out, err := exec.Command("launchctl", "asuser", strconv.Itoa(uid),
+		"/usr/bin/osascript", "-e", script).CombinedOutput()
+	if err != nil {
+		logln("aviso NAO exibido (osascript): %v (%s)", err, strings.TrimSpace(string(out)))
+		return
+	}
+	logln("aviso exibido na tela (uid %d): %s", uid, titulo)
+}
+
+// mapaDePais le a lista de processos e devolve filho -> pai. O equivalente do
+// snapshot do Windows; a caminhada na arvore e comum aos dois (descendentesDe).
+// (nil, false) quando a leitura falha: o chamador nao age nesse caso.
+func mapaDePais() (map[uint32]uint32, bool) {
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=").Output()
+	if err != nil {
+		return nil, false
+	}
+	pais := parseMapaDePais(string(out))
+	if len(pais) == 0 {
+		// Nem o proprio agente apareceu: a leitura nao vale.
+		return nil, false
+	}
+	return pais, true
+}
+
+// socketsDeSessao conta os TCP ESTABLISHED dos PIDs dados que NAO sao o vinculo do
+// rendezvous. (0, false) = leitura falhou; o chamador nao age nesse caso.
+//
+// O lsof aceita varios PIDs numa chamada so (-p com lista separada por virgula), o
+// que importa aqui: a partir de 18/09 o watchdog passou a olhar a ARVORE do cliente,
+// e nao um processo — uma chamada por PID multiplicaria o custo a cada tick de 3s.
+func socketsDeSessao(pids map[uint32]bool) (int, bool) {
+	if len(pids) == 0 {
+		return 0, false
+	}
+	lista := make([]string, 0, len(pids))
+	for pid := range pids {
+		lista = append(lista, strconv.FormatUint(uint64(pid), 10))
+	}
+
+	out, err := exec.Command("lsof",
+		"-nP", // sem resolver DNS nem nome de porta
+		"-a",  // combina os filtros em E, nao em OU
+		"-p", strings.Join(lista, ","),
+		"-iTCP", "-sTCP:ESTABLISHED",
+		"-Fn", // um campo por linha: estavel entre versoes
+	).Output()
+	if err != nil {
+		// O lsof sai com 1 quando NAO ha socket casando o filtro — maquina ociosa,
+		// que e caso legitimo e nao falha de leitura. Distinguimos pelo exit code.
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 && len(out) == 0 {
+			return 0, true
+		}
+		return 0, false
+	}
+	return contaSocketsSessao(string(out)), true
 }

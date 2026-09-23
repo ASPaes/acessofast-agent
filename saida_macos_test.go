@@ -258,3 +258,83 @@ func TestPidDoServidorComOClienteInstaladoComoServico(t *testing.T) {
 		t.Error("--cm sozinho nao pode ser tomado por servidor")
 	}
 }
+
+// A caminhada na arvore (descendentesDe) ja tem teste no lado comum; aqui e o parse
+// da saida do ps, que e por onde o mapa chega no macOS.
+func TestParseMapaDePais(t *testing.T) {
+	// Formato de `ps -axo pid=,ppid=`: colunas alinhadas a direita, com folga.
+	saida := "    1     0\n  501     1\n 45382   501\n 45384 45382\n"
+
+	pais := parseMapaDePais(saida)
+	if len(pais) != 4 {
+		t.Fatalf("esperava 4 processos, veio %d: %v", len(pais), pais)
+	}
+	if pais[45384] != 45382 {
+		t.Errorf("pai de 45384 = %d, esperava 45382", pais[45384])
+	}
+
+	// Com esse mapa, a arvore do cliente (raiz 45382) tem que pegar o filho.
+	arvore := descendentesDe(pais, 45382)
+	if !arvore[45382] || !arvore[45384] {
+		t.Errorf("arvore de 45382 incompleta: %v", arvore)
+	}
+	if arvore[501] {
+		t.Error("a arvore subiu para o pai; descendentesDe deve so descer")
+	}
+}
+
+func TestParseMapaDePaisIgnoraLixo(t *testing.T) {
+	saida := "PID PPID\n" + // cabecalho, se alguem tirar o "=" do formato
+		"   abc   1\n" + // pid ilegivel
+		"   0      1\n" + // pid 0 nao existe
+		"   700\n" + // linha incompleta
+		"\n" +
+		"   800   700\n"
+	pais := parseMapaDePais(saida)
+	if len(pais) != 1 || pais[800] != 700 {
+		t.Errorf("esperava so 800->700, veio %v", pais)
+	}
+}
+
+// FRONTEIRA DE CONFIANCA, nao formatacao. A mensagem do aviso vem do SERVIDOR e
+// termina dentro de um script que roda como o usuario logado. Aspa nao escapada
+// fecharia o literal e o resto seria executado — e o AppleScript chama shell.
+func TestCitaAppleScriptNaoDeixaEscaparDoLiteral(t *testing.T) {
+	casos := []struct {
+		nome     string
+		entrada  string
+		esperado string
+	}{
+		{"texto simples", "Atualize o AcessoFast", `"Atualize o AcessoFast"`},
+		{"com aspas", `diga "ola"`, `"diga \"ola\""`},
+		{"com barra invertida", `C:\temp`, `"C:\temp"`},
+		{"quebra de linha", "linha1\nlinha2", `"linha1\nlinha2"`},
+		{"crlf", "a\r\nb", `"a\nb"`},
+		{
+			// A tentativa de injecao: fechar o literal e emendar codigo.
+			"injecao de AppleScript",
+			`x" & (do shell script "id") & "`,
+			`"x\" & (do shell script \"id\") & \""`,
+		},
+	}
+	for _, c := range casos {
+		if got := citaAppleScript(c.entrada); got != c.esperado {
+			t.Errorf("%s:\n  citaAppleScript(%q)\n  =      %s\n  espera %s", c.nome, c.entrada, got, c.esperado)
+		}
+	}
+
+	// Invariante que resume tudo: fora das pontas, nao pode existir aspa sem a
+	// barra invertida na frente.
+	// barraInvertida como string crua: escrever '\\' num literal e justamente o que
+	// se erra sem perceber, e este teste existe pra pegar erro de escape.
+	const barraInvertida = `\`
+
+	saida := citaAppleScript(`a"b` + barraInvertida + `"c`)
+	meio := saida[1 : len(saida)-1]
+	for i := 0; i < len(meio); i++ {
+		if meio[i] == '"' && (i == 0 || meio[i-1] != barraInvertida[0]) {
+			t.Fatalf("aspa sem escape na posicao %d de %s", i, saida)
+		}
+	}
+
+}
