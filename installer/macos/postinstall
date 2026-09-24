@@ -82,11 +82,23 @@ if [ -f "$AGENT_PLIST" ]; then
 	chmod 644 "$AGENT_PLIST"
 	UID_CONSOLE="$(stat -f %u /dev/console 2>/dev/null || echo 0)"
 	if [ "$UID_CONSOLE" != "0" ]; then
-		launchctl bootout "gui/$UID_CONSOLE/com.carriez.AcessoFast_server" 2>/dev/null || true
-		if launchctl bootstrap "gui/$UID_CONSOLE" "$AGENT_PLIST" 2>/dev/null; then
+		# asuser: o bootstrap tem de rodar DENTRO da sessao do usuario. Pedido direto pelo
+		# root o launchd recusa — provado em campo em 23/09/2026, quando o .pkg instalou
+		# tudo no lugar e o servico do cliente nao subiu. O MESMO comando, rodado pelo
+		# proprio usuario, sai 0. E o asuser que da esse contexto, e e o que ja usamos pra
+		# mostrar o aviso na tela (entregaAviso, em plat_darwin.go).
+		launchctl asuser "$UID_CONSOLE" launchctl bootout "gui/$UID_CONSOLE/com.carriez.AcessoFast_server" 2>/dev/null || true
+		if ERRO="$(launchctl asuser "$UID_CONSOLE" launchctl bootstrap "gui/$UID_CONSOLE" "$AGENT_PLIST" 2>&1)"; then
 			echo "AcessoFast: servico do cliente carregado na sessao do uid $UID_CONSOLE"
 		else
-			echo "AcessoFast: AVISO — nao consegui carregar o servico do cliente na sessao grafica"
+			# A mensagem do launchctl vai pro install.log em vez do lixo: o 2>/dev/null que
+			# estava aqui escondeu a causa e custou um dia de diagnostico.
+			echo "AcessoFast: AVISO — bootstrap via asuser falhou: ${ERRO:-sem mensagem}"
+			if ERRO2="$(launchctl bootstrap "gui/$UID_CONSOLE" "$AGENT_PLIST" 2>&1)"; then
+				echo "AcessoFast: servico do cliente carregado (bootstrap direto)"
+			else
+				echo "AcessoFast: AVISO — nao consegui carregar o servico do cliente: ${ERRO2:-sem mensagem}"
+			fi
 		fi
 	else
 		echo "AcessoFast: ninguem logado na interface — o servico do cliente sobe no proximo login"

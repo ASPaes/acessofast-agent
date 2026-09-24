@@ -449,6 +449,12 @@ type tailer struct {
 	clienteParadoDesde  time.Time
 	ultimaSubidaCliente time.Time
 
+	// clienteAusente: a ultima leitura de clientProcStartTime NAO achou o processo do
+	// cliente. E o que separa "o cliente acabou de subir" de "esta e a primeira leitura
+	// deste agente" — as duas chegam em poll() com clientStart zerado, e so a primeira
+	// pede re-sincronizacao de senha. Ver decideSubidaDoCliente.
+	clienteAusente bool
+
 	// autenticada: alguma conexao DESTA sessao passou do login. Falso enquanto so
 	// houve accept de TCP — que e o que uma senha recusada produz. So a sessao
 	// autenticada gira a senha efemera no fim (ver rotacionarSeAutenticada). Vale pela
@@ -741,25 +747,34 @@ func (t *tailer) poll() {
 	// de 90s nunca fecha porque o heartbeat esta fresco). Detecta pelo start-time do
 	// processo (sinal fora do log, que sozinho nao distingue restart de rotacao benigna) e
 	// encerra a sessao. Se o peer ja reconectou, o prime abaixo abre uma sessao nova.
-	if st, ok := clientProcStartTime(); ok {
-		if !t.clientStart.IsZero() && st.After(t.clientStart) {
-			if len(t.open) > 0 {
+	st, noAr := clientProcStartTime()
+	subiu, apareceu, ausente := decideSubidaDoCliente(noAr, st, t.clientStart, t.clienteAusente)
+	t.clienteAusente = ausente
+	if subiu {
+		if len(t.open) > 0 {
+			if apareceu {
+				logln("cliente apareceu (nao estava no ar) — conexoes cairam sem 'closed'; encerrando sessao")
+			} else {
 				logln("cliente reiniciou (%s -> %s) — conexoes cairam sem 'closed'; encerrando sessao",
 					t.clientStart.Format("15:04:05"), st.Format("15:04:05"))
-				t.open = make(map[string]time.Time)
-				t.graceUntil = time.Time{}
-				t.hardCapUntil = time.Time{}
-				t.controllerID = ""
-				t.autenticada = false // fim real -> nao vaza a marca pra sessao seguinte
-				postEvent("end", "")
 			}
-			t.primed = false // re-prima do log novo
-			t.offset = 0
-			// O cliente subiu de novo lendo a config do disco: a senha que ele passa a
-			// exigir pode nao ser a que o painel conhece. Re-sincroniza (o rotateNow so
-			// aplica com o cliente de pe, e aqui ele acabou de subir).
-			go rotateAposRestartDoCliente()
+			t.open = make(map[string]time.Time)
+			t.graceUntil = time.Time{}
+			t.hardCapUntil = time.Time{}
+			t.controllerID = ""
+			t.autenticada = false // fim real -> nao vaza a marca pra sessao seguinte
+			postEvent("end", "")
+		} else if apareceu {
+			logln("cliente apareceu (nao estava no ar) — re-sincronizando a senha")
 		}
+		t.primed = false // re-prima do log novo
+		t.offset = 0
+		// O cliente subiu de novo lendo a config do disco: a senha que ele passa a
+		// exigir pode nao ser a que o painel conhece. Re-sincroniza (o rotateNow so
+		// aplica com o cliente de pe, e aqui ele acabou de subir).
+		go rotateAposRestartDoCliente()
+	}
+	if noAr {
 		t.clientStart = st
 	}
 
