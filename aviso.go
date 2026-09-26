@@ -88,6 +88,14 @@ func mostraAviso(a *avisoServidor) {
 		titulo = "AcessoFast"
 	}
 
+	// Anuncio com criativo: desenha uma JANELA do AcessoFast com a imagem, na
+	// sessao do usuario (anuncio_lanca_windows.go). So se conseguir lancar; se
+	// qualquer passo falhar, cai no WTSSendMessage de texto abaixo — a mesma
+	// mensagem, sem imagem. Assim o momento "esgotado" nunca fica mudo.
+	if strings.TrimSpace(a.ImageURL) != "" && lancaAnuncioNaSessao(a) {
+		return
+	}
+
 	go func() {
 		sessao := windows.WTSGetActiveConsoleSessionId()
 		if sessao == 0xFFFFFFFF {

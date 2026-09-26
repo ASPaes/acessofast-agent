@@ -294,6 +294,11 @@ type ingestResp struct {
 type avisoServidor struct {
 	Titulo   string `json:"titulo"`
 	Mensagem string `json:"mensagem"`
+	// Anuncio com criativo (26/09/2026): URL assinada da imagem no bucket privado
+	// ad-creatives, assinada pela session-ingest. Vem so em tipo=anuncio com arte.
+	// Presente -> desenha uma janela do AcessoFast com a imagem (anuncio_ui_windows.go);
+	// ausente -> caixa de texto WTSSendMessage de sempre (aviso.go).
+	ImageURL string `json:"image_url"`
 }
 
 // postEvent posta um evento de sessao e devolve o hard_cap_at da resposta (zero se
@@ -993,6 +998,15 @@ func openLog() {
 }
 
 func main() {
+	// Subcomando de UI do anuncio: o servico (sessao 0, sem interface) se
+	// re-executa DENTRO da sessao interativa do usuario para desenhar a janela do
+	// anuncio (ver anuncio_lanca_windows.go -> CreateProcessAsUser). Intercepta
+	// antes de tudo: nao e servico nem matricula, so desenha e sai.
+	if len(os.Args) >= 3 && os.Args[1] == "mostrar-anuncio" {
+		rodarAnuncioUI(os.Args[2])
+		return
+	}
+
 	// --enroll intercepta ANTES de decidir servico/console: a matricula e um
 	// caminho one-shot, roda e sai. flag.Parse consome --secret/--alias tambem.
 	var (
