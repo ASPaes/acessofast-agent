@@ -35,7 +35,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: rustdesk/rustdesk
-          ref: refs/tags/${{ inputs.version }}
+          # Sem o prefixo refs/tags/: o checkout aceita tag, branch ou SHA. O
+          # Windows segue passando tag (1.4.9); o Android passa um commit do
+          # master enquanto nao ha tag com a API 36 (ver build-client-android.yml).
+          ref: ${{ inputs.version }}
           submodules: recursive
         
       - name: Checkout source code

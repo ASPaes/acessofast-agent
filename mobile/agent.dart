@@ -56,8 +56,20 @@ const String _claimStatusUrl = '$_fnBase/claim-status';
 const String _anonKey =
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsbWZ5aWJ5cm93YmdqanlibGNsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM2NDMyNjIsImV4cCI6MjA5OTIxOTI2Mn0.grcQYqN3fHvFTWI0AFPWG66k1wONuGqZ5yMt07qcjxE';
 
+// Sondagem LOCAL do ID enquanto o núcleo sobe (não chama servidor).
 const Duration _pollInterval = Duration(seconds: 15);
 const Duration _httpTimeout = Duration(seconds: 20);
+
+// Poll do claim-status em DUAS velocidades, igual ao matricula.go (PR #11).
+// Uma instalação normal é adotada em minutos: nas primeiras 2h nada muda (15s).
+// Depois disso o pedido claramente ficou esquecido — e com o app na Play Store
+// esse vira o caso comum, porque qualquer pessoa instala sem técnico nenhum. A
+// 15s para sempre, cada celular desses custaria 5.760 chamadas por dia na cota
+// de invocações. A 10 min a adoção continua funcionando, só demora até esse
+// tempo para ser notada.
+const Duration _claimPollHot = Duration(seconds: 15);
+const Duration _claimPollCold = Duration(minutes: 10);
+const Duration _claimHotWindow = Duration(hours: 2);
 
 const String _enrollStateFile = 'acessofast_enroll.state';
 const String _credentialsFile = 'acessofast_agent.json';
@@ -73,20 +85,40 @@ void _log(String msg) {
 class _EnrollState {
   final String nonce; // prova de posse; só sai daqui no poll (sob TLS)
   final String token; // vira a credencial do agente; só o hash é registrado
+  // Início da tentativa de matrícula, PERSISTIDO junto. Em memória, reabrir o
+  // app (ou o re-registro do claim, que expira de hora em hora) zeraria a janela
+  // quente e o poll de 15s voltaria para sempre — o próprio bug. Mesma âncora
+  // do StartedAt do matricula.go.
+  final DateTime startedAt;
 
-  const _EnrollState(this.nonce, this.token);
+  const _EnrollState(this.nonce, this.token, this.startedAt);
 
-  Map<String, dynamic> toJson() => {'nonce': nonce, 'token': token};
+  Map<String, dynamic> toJson() => {
+        'nonce': nonce,
+        'token': token,
+        'started_at': startedAt.toUtc().toIso8601String(),
+      };
 
   static _EnrollState? fromJson(Map<String, dynamic> j) {
     final n = j['nonce'];
     final t = j['token'];
     if (n is String && t is String && n.isNotEmpty && t.isNotEmpty) {
-      return _EnrollState(n, t);
+      // Estado gravado por versão anterior não tem started_at: conta a partir
+      // de agora. Tratar como "antiquíssimo" jogaria direto no poll lento uma
+      // matrícula que talvez tenha começado há 5 minutos — erra pro lado do
+      // operador, como o matricula.go.
+      final s = j['started_at'];
+      return _EnrollState(
+          n, t, (s is String ? DateTime.tryParse(s) : null) ?? DateTime.now());
     }
     return null;
   }
 }
+
+Duration _claimPollDelay(DateTime startedAt) =>
+    DateTime.now().difference(startedAt) < _claimHotWindow
+        ? _claimPollHot
+        : _claimPollCold;
 
 /// 32 bytes aleatórios em base64url SEM padding — idêntico ao
 /// base64.RawURLEncoding do Go, para que os hashes batam com o servidor.
@@ -112,6 +144,15 @@ Future<_EnrollState> _loadOrCreateState() async {
         final st = _EnrollState.fromJson(parsed);
         if (st != null) {
           _log('estado de matrícula recuperado do disco');
+          // Veio de versão sem started_at: grava o de agora, senão cada
+          // reabertura do app recomeçaria a janela quente.
+          if (parsed['started_at'] == null) {
+            try {
+              await f.writeAsString(jsonEncode(st.toJson()), flush: true);
+            } catch (e) {
+              _log('WARN não persistiu started_at: $e');
+            }
+          }
           return st;
         }
       }
@@ -120,7 +161,7 @@ Future<_EnrollState> _loadOrCreateState() async {
     _log('WARN não consegui ler enroll.state: $e (gerando novo)');
   }
 
-  final st = _EnrollState(_randB64Url(32), _randB64Url(32));
+  final st = _EnrollState(_randB64Url(32), _randB64Url(32), DateTime.now());
   try {
     final f = await _stateFile(_enrollStateFile);
     await f.writeAsString(jsonEncode(st.toJson()), flush: true);
@@ -262,12 +303,26 @@ Future<void> _runEnrollment() async {
   await _postClaimRegister(rid, nonceHash, tokenHash, host, os);
   _log('claim registrado; aguardando adoção pelo painel');
 
+  var esfriou = false;
   while (true) {
-    await Future<void>.delayed(_pollInterval);
+    final delay = _claimPollDelay(st.startedAt);
+    if (delay == _claimPollCold && !esfriou) {
+      esfriou = true;
+      _log('sem adoção há ${_claimHotWindow.inHours}h — poll passa a '
+          '${_claimPollCold.inMinutes} min (a adoção ainda funciona, só demora '
+          'até esse tempo para ser notada)');
+    }
+    await Future<void>.delayed(delay);
 
     switch (await _postClaimStatus(rid, st.nonce)) {
       case 'approved':
       case 'consumed':
+        // 'consumed' NÃO prova adoção: desde 05/09/2026 o servidor responde
+        // assim também para a matrícula esquecida há 48h (quiesce), justamente
+        // para o laço parar. Gravamos a credencial mesmo assim — o pedido fica
+        // vivo por 1 ano e, quando o técnico adotar, o token guardado agora é o
+        // mesmo que a adoção registra. Quem descobre se o aparelho está de fato
+        // no cadastro é o session.dart, pela resposta do presence.
         try {
           await _writeCredentials(st.token, rid);
           await _clearEnrollState();
