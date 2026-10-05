@@ -1,0 +1,75 @@
+# Assina um build do APP AcessoFast para o auto-update feito pelo agente (atualiza_app.go).
+#
+# O app é compilado fora daqui (repo acessofast-desktop, scripts/publicar-app.sh), que cria o
+# release "app-<versão>" NESTE repo (público: o agente baixa daqui sem credencial) com o
+# executável AcessoFast-<versão>.exe e dispara este workflow. Aqui:
+#   1. baixa o executável do release;
+#   2. calcula o sha256 e assina "acessofast-client:v1:<versão>:<sha256>" com a MESMA chave
+#      do auto-update do agente (secret AGENT_UPDATE_SIGNING_KEY), que só existe neste CI;
+#   3. anexa a assinatura ao release e imprime o SQL do client_releases.
+#
+# Como no build-agent.yml, o CI não tem credencial do banco de propósito: catalogar o release
+# é um passo humano (ou de quem opera o painel), e catalogar NÃO instala nada — só o alvo
+# (address_book / tenant_settings / client_update_policy) instala.
+name: assina-app
+
+on:
+  workflow_dispatch:
+    inputs:
+      versao:
+        description: "Versão do app (ex.: 2026.10.05-abc1234), a mesma do acessofast-versao.txt"
+        required: true
+      ref_ferramenta:
+        description: "Ref com o tools/sign-manifest que conhece -produto app"
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  assina:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref_ferramenta }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Baixa, confere e assina
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AGENT_UPDATE_SIGNING_KEY: ${{ secrets.AGENT_UPDATE_SIGNING_KEY }}
+          VERSAO: ${{ inputs.versao }}
+        run: |
+          set -euo pipefail
+          # Versão é rótulo de build: data + commit. Qualquer outra coisa para aqui.
+          echo "$VERSAO" | grep -Eq '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{7}$' \
+            || { echo "versão inválida: $VERSAO"; exit 1; }
+          TAG="app-$VERSAO"
+          ARQ="AcessoFast-$VERSAO.exe"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ARQ" --dir dl
+          SHA256=$(sha256sum "dl/$ARQ" | cut -d' ' -f1)
+          SIG=$(go run ./tools/sign-manifest -produto app -version "$VERSAO" -sha256 "$SHA256")
+          URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/$TAG/$ARQ"
+          printf '%s\n' "$SIG" > assinatura-app.txt
+          gh release upload "$TAG" assinatura-app.txt --clobber --repo "$GITHUB_REPOSITORY"
+
+          SQL="insert into public.client_releases (version, platform, url, sha256, signature, notes) values ('$VERSAO', 'windows', '$URL', '$SHA256', '$SIG', 'app AcessoFast $VERSAO');"
+          echo "$SQL"
+          {
+            echo "## App AcessoFast $VERSAO assinado"
+            echo
+            echo "Catalogar (não instala nada):"
+            echo '```sql'
+            echo "$SQL"
+            echo '```'
+            echo
+            echo "Canary numa máquina:"
+            echo '```sql'
+            echo "update public.address_book set client_target_version = '$VERSAO' where rustdesk_id = '<id>';"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
