@@ -96,6 +96,13 @@ func manifestoCanonico(version, sha256hex string) string {
 // a URL nao serve de nada (o conteudo baixado nao casaria com o hash). Deixar a URL
 // de fora e o que permite trocar de hospedagem sem reassinar releases antigos.
 func verificaAssinatura(u *updateInfo) error {
+	return verificaAssinaturaDe(u, manifestoCanonico)
+}
+
+// verificaAssinaturaDe e a verificacao com o manifesto de cada produto: o do agente
+// (manifestoCanonico) ou o do app (manifestoCanonicoApp, em atualiza_app.go). Mesma chave,
+// prefixos diferentes.
+func verificaAssinaturaDe(u *updateInfo, manifesto func(version, sha256hex string) string) error {
 	pub, err := base64.StdEncoding.DecodeString(updatePubKeyB64)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return fmt.Errorf("chave publica embutida invalida")
@@ -104,7 +111,7 @@ func verificaAssinatura(u *updateInfo) error {
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return fmt.Errorf("assinatura mal formada")
 	}
-	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(manifestoCanonico(u.Version, u.SHA256)), sig) {
+	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(manifesto(u.Version, u.SHA256)), sig) {
 		return fmt.Errorf("assinatura NAO confere")
 	}
 	return nil
@@ -114,10 +121,15 @@ func verificaAssinatura(u *updateInfo) error {
 // conteudo casa com o sha256 do manifesto ja verificado. O hash e calculado durante
 // a escrita (streaming) — nao carregamos o binario inteiro em memoria.
 func baixaEConfere(u *updateInfo) (string, error) {
+	return baixaEConfereComo(u, "acessofast-agent-"+u.Version+".exe")
+}
+
+// baixaEConfereComo e o download com o nome do arquivo de cada produto (agente ou app).
+func baixaEConfereComo(u *updateInfo, nome string) (string, error) {
 	if err := os.MkdirAll(updateDir, 0755); err != nil {
 		return "", fmt.Errorf("mkdir %s: %w", updateDir, err)
 	}
-	dest := filepath.Join(updateDir, "acessofast-agent-"+u.Version+".exe")
+	dest := filepath.Join(updateDir, nome)
 	tmp := dest + ".part"
 	_ = os.Remove(tmp)
 

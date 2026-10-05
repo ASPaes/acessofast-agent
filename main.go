@@ -268,6 +268,9 @@ type ingestResp struct {
 	// quando o alvo resolvido no servidor difere da versao que este agente reportou.
 	// Ver update.go.
 	Update *updateInfo `json:"update"`
+	// Atualizacao do APP AcessoFast (atualiza_app.go). Mesmo formato e mesmas regras do
+	// bloco acima; so vem no presence e so para agente que reportou client_version.
+	ClientUpdate *updateInfo `json:"client_update"`
 	// Aviso para MOSTRAR NA TELA desta maquina. Hoje ha um caso: o operador
 	// acessou, direto pelo cliente, um computador cujo AcessoFast esta velho
 	// demais para se atualizar sozinho.
@@ -338,6 +341,13 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 	if controllerID != "" {
 		m["controller_rustdesk_id"] = controllerID
 	}
+	// Versao do app instalado (atualiza_app.go): so no presence, que e o unico evento que
+	// pode trazer client_update. Vazio = app nao encontrado; ai nao manda nada.
+	if event == "presence" {
+		if v := versaoDoApp(); v != "" {
+			m["client_version"] = v
+		}
+	}
 	payload, _ := json.Marshal(m)
 	req, err := http.NewRequest("POST", ingestURL, bytes.NewReader(payload))
 	if err != nil {
@@ -403,6 +413,12 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 	// os dois vierem juntos, a senha e aplicada e confirmada antes de o servico reiniciar.
 	if r.Senha != nil {
 		aplicaSenhaDoPainel(r.Senha)
+	}
+
+	// Atualizacao do app: guardada para o worker aplicar depois do update do agente, no
+	// mesmo tick do presence (atualiza_app.go). So do presence, que prova a maquina ociosa.
+	if event == "presence" {
+		appUpdatePendente = r.ClientUpdate
 	}
 
 	return cap, r.Update
@@ -962,6 +978,12 @@ func worker(stop <-chan struct{}) {
 				// em paralelo com outro tick de presence.
 				if _, upd := postEventFull("presence", ""); upd != nil {
 					aplicaUpdate(upd)
+				}
+				// Depois do agente, o app (atualiza_app.go). Tambem inline: a instalacao
+				// derruba o servico do app por alguns segundos e nao pode correr em
+				// paralelo com a deteccao de sessao nem com a autocura do vigia_cliente.
+				if app := pegaAtualizacaoDoApp(); app != nil {
+					aplicaAtualizacaoDoApp(app)
 				}
 			}
 		}

@@ -10,7 +10,9 @@
 // provar), mas silenciosa do lado de ca. Por isso o formato esta escrito uma vez
 // so, aqui e la, e com o mesmo comentario.
 //
-//	acessofast-agent:v1:<version>:<sha256 minusculo>
+//	acessofast-agent:v1:<version>:<sha256 minusculo>     (-produto agente, o padrao)
+//	acessofast-client:v1:<version>:<sha256 minusculo>    (-produto app: o app AcessoFast,
+//	                                                      ver atualiza_app.go)
 //
 // O prefixo com nome e versao do protocolo da separacao de dominio: impede que uma
 // assinatura gerada pra outro proposito com a mesma chave valha como update.
@@ -28,7 +30,14 @@ import (
 func main() {
 	version := flag.String("version", "", "versao do build (AAAA.MM.DD-<sha7>)")
 	sum := flag.String("sha256", "", "sha256 do binario, em hex")
+	produto := flag.String("produto", "agente", "agente | app (o app AcessoFast instalado pelo agente)")
 	flag.Parse()
+
+	prefixo := map[string]string{"agente": "acessofast-agent", "app": "acessofast-client"}[*produto]
+	if prefixo == "" {
+		fmt.Fprintln(os.Stderr, "-produto tem que ser agente ou app")
+		os.Exit(2)
+	}
 
 	if *version == "" || *sum == "" {
 		fmt.Fprintln(os.Stderr, "uso: sign-manifest -version <v> -sha256 <hex>")
@@ -52,7 +61,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	msg := "acessofast-agent:v1:" + *version + ":" + strings.ToLower(strings.TrimSpace(*sum))
+	msg := prefixo + ":v1:" + *version + ":" + strings.ToLower(strings.TrimSpace(*sum))
 	sig := ed25519.Sign(ed25519.PrivateKey(priv), []byte(msg))
 
 	// Só a assinatura em stdout, pra dar `SIG=$(sign-manifest ...)` no shell.
