@@ -99,6 +99,36 @@ func motivoPularApp(u *updateInfo, atual, jaAplicado string, tentativas int) str
 	return ""
 }
 
+// acessoEmAndamento devolve "" quando nenhum AcessoFast desta maquina tem acesso remoto aberto
+// (recebido ou feito daqui), ou o motivo para esperar.
+func acessoEmAndamento() string {
+	pids := map[uint32]bool{}
+	if p, ok := pidsDoCliente(); ok {
+		for pid := range p {
+			pids[pid] = true
+		}
+	}
+	nome := "AcessoFast.exe"
+	if exe, err := findRustDeskExe(); err == nil {
+		nome = filepath.Base(exe)
+	}
+	p, ok := pidsPorNome(nome)
+	if !ok {
+		return "nao consegui listar os processos"
+	}
+	for pid := range p {
+		pids[pid] = true
+	}
+	n, ok := socketsDeAcesso(pids)
+	if !ok {
+		return "nao consegui ler as conexoes"
+	}
+	if n > 0 {
+		return "acesso remoto em andamento"
+	}
+	return ""
+}
+
 // pegaAtualizacaoDoApp entrega (e limpa) o bloco recebido no presence.
 func pegaAtualizacaoDoApp() *updateInfo {
 	u := appUpdatePendente
@@ -118,14 +148,14 @@ func aplicaAtualizacaoDoApp(u *updateInfo) {
 		return
 	}
 
-	// Ultima conferencia de sessao, direto nos sockets: o presence so sai sem sessao no log,
-	// mas instalar derruba o servico, e derrubar um atendimento e o erro caro. Leitura
-	// duvidosa conta como "tem sessao": adia para o proximo presence.
-	if pids, ok := pidsDoCliente(); ok {
-		if n, ok := socketsDeSessao(pids); !ok || n > 0 {
-			logln("app %s: adiado (sessao em andamento ou leitura duvidosa)", u.Version)
-			return
-		}
+	// Ultima conferencia de acesso, direto nos sockets, nos DOIS sentidos: instalar mata todo
+	// AcessoFast.exe da maquina. O presence so prova que ninguem esta acessando ESTA maquina;
+	// nao ve o tecnico acessando OUTRA a partir dela (janela de sessao do usuario, fora da
+	// arvore do servico). Em 06/10/2026 isso derrubou um atendimento do Ryan. Leitura
+	// duvidosa conta como "tem acesso": adia para o proximo presence.
+	if motivo := acessoEmAndamento(); motivo != "" {
+		logln("app %s: adiado (%s)", u.Version, motivo)
+		return
 	}
 
 	appUpdateTries[u.Version]++

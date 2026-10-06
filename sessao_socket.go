@@ -23,6 +23,7 @@
 package main
 
 import (
+	"strings"
 	"time"
 	"unsafe"
 
@@ -232,6 +233,58 @@ func pidsDoCliente() (map[uint32]bool, bool) {
 // socketsDeSessao conta os TCP ESTABLISHED dos PIDs dados que NAO sao o vinculo do
 // rendezvous. (0, false) = leitura falhou; o chamador nao age nesse caso (fail-safe).
 func socketsDeSessao(pids map[uint32]bool) (int, bool) {
+	return contaSockets(pids, func(porta uint16) bool {
+		return porta == portaNatTest || porta == portaRendezvous // maquina ociosa falando com o servidor
+	})
+}
+
+// socketsDeAcesso conta os TCP ESTABLISHED dos PIDs dados que podem ser um ACESSO REMOTO,
+// em qualquer sentido. Alem do rendezvous, ignora a web (80/443): a janela do app fala com o
+// painel (Supabase) e com o GitHub por HTTPS, e isso nao e acesso a computador nenhum — contar
+// faria o tecnico logado nunca receber atualizacao. Acesso remoto usa o relay (21117), as
+// portas de websocket (21118/21119) ou conexao direta em porta alta, e todas essas contam.
+func socketsDeAcesso(pids map[uint32]bool) (int, bool) {
+	return contaSockets(pids, portaIgnoradaNoAcesso)
+}
+
+func portaIgnoradaNoAcesso(porta uint16) bool {
+	switch porta {
+	case portaNatTest, portaRendezvous, 80, 443:
+		return true
+	}
+	return false
+}
+
+// pidsPorNome devolve os PIDs de TODOS os processos com esse executavel (ex.: AcessoFast.exe).
+// Existe para o acesso que o TECNICO abre a partir desta maquina: a janela de sessao e um
+// processo do usuario, fora da arvore do servico, e pidsDoCliente nao a enxerga. (nil, false)
+// quando o snapshot falha.
+func pidsPorNome(nome string) (map[uint32]bool, bool) {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil, false
+	}
+	defer windows.CloseHandle(snap)
+
+	var e windows.ProcessEntry32
+	e.Size = uint32(unsafe.Sizeof(e))
+	if err := windows.Process32First(snap, &e); err != nil {
+		return nil, false
+	}
+	pids := map[uint32]bool{}
+	for {
+		if strings.EqualFold(windows.UTF16ToString(e.ExeFile[:]), nome) {
+			pids[e.ProcessID] = true
+		}
+		if err := windows.Process32Next(snap, &e); err != nil {
+			break
+		}
+	}
+	return pids, true
+}
+
+// contaSockets: TCP ESTABLISHED dos PIDs dados cuja porta remota NAO e ignorada.
+func contaSockets(pids map[uint32]bool, ignorar func(porta uint16) bool) (int, bool) {
 	total := 0
 	for _, fam := range []uintptr{afInet, afInet6} {
 		buf, ok := tabelaTCP(fam)
@@ -263,9 +316,8 @@ func socketsDeSessao(pids map[uint32]bool) (int, bool) {
 			if !pids[dono] || estado != mibTCPStateEstab {
 				continue
 			}
-			switch portaDe(remota) {
-			case portaNatTest, portaRendezvous:
-				continue // maquina ociosa falando com o servidor
+			if ignorar(portaDe(remota)) {
+				continue
 			}
 			total++
 		}

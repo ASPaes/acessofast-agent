@@ -99,3 +99,19 @@ func TestVersaoNaPasta(t *testing.T) {
 		t.Fatalf("arquivo vazio virou versao: %q", v)
 	}
 }
+
+// Acesso remoto conta em qualquer porta, menos a do vinculo com o servidor e a web (o app
+// fala com o painel por HTTPS o tempo todo; contar isso travaria a atualizacao do tecnico).
+func TestPortaIgnoradaNoAcesso(t *testing.T) {
+	for _, p := range []uint16{portaNatTest, portaRendezvous, 80, 443} {
+		if !portaIgnoradaNoAcesso(p) {
+			t.Errorf("porta %d deveria ser ignorada", p)
+		}
+	}
+	// 21117 = relay, 21118/21119 = websocket, 50123 = conexao direta (P2P).
+	for _, p := range []uint16{21117, 21118, 21119, 50123} {
+		if portaIgnoradaNoAcesso(p) {
+			t.Errorf("porta %d e de acesso remoto e foi ignorada", p)
+		}
+	}
+}
