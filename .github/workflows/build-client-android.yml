@@ -183,7 +183,8 @@ jobs:
             echo "::error::interface_nova gera o AcessoFast Beta, que nao vai para a Play. Desmarque gerar_aab."
             exit 1
           fi
-          for f in inicio.dart celular.dart comum.dart tema.dart; do
+          for f in inicio.dart celular.dart comum.dart tema.dart painel.dart textos.dart avisos.dart \
+                   assistente.dart pedido.dart acessar.dart ajustes.dart registro.dart; do
             [ -f "./mobile/ui/$f" ] || { echo "::error::mobile/ui/$f ausente."; exit 1; }
           done
           echo "interface nova ok."
@@ -884,7 +885,7 @@ jobs:
             exit 1
           fi
 
-      # INTERFACE NOVA (etapa 1 do PLANO-MOBILE.md do acessofast-desktop). So com
+      # INTERFACE NOVA (PLANO-MOBILE.md do acessofast-desktop). So com
       # interface_nova: o app da loja continua saindo com as telas de hoje. Mesma regra do
       # desktop: trocamos so widgets. A HomePage do RustDesk continua montada (o
       # HomePage.homeKey e usado pelo chat e pelas configuracoes), mas desenha a nossa casca;
@@ -902,12 +903,13 @@ jobs:
           mkdir -p ./flutter/lib/acessofast/ui ./flutter/assets/acessofast
           cp "$AF_AGENT"/ui/*.dart ./flutter/lib/acessofast/ui/
           cp -r "$AF_AGENT/ui/assets/fonts" ./flutter/assets/acessofast/fonts
+          cp "$AF_BRANDING/icon.png" ./flutter/assets/acessofast/icon.png
           ls -la ./flutter/lib/acessofast/ui ./flutter/assets/acessofast/fonts
 
           # Casca nova no lugar das abas do RustDesk.
           f=./flutter/lib/mobile/pages/home_page.dart
           troca "$f" "import 'connection_page.dart';" "s|^import 'connection_page.dart';|&\nimport 'package:flutter_hbb/acessofast/ui/inicio.dart';|"
-          troca "$f" "  Widget build(BuildContext context) {" "0,/^  Widget build(BuildContext context) {$/s||&\n    // AcessoFast: interface nova.\n    return AfInicioMobile(acessar: ConnectionPage(appBarActions: []), ajustes: SettingsPage());\n    // ignore: dead_code|"
+          troca "$f" "  Widget build(BuildContext context) {" "0,/^  Widget build(BuildContext context) {$/s||&\n    // AcessoFast: interface nova.\n    return const AfInicioMobile();\n    // ignore: dead_code|"
 
           # Cores e fonte do AcessoFast por cima do tema do RustDesk (vale para as telas antigas
           # que ainda aparecem: Acessar, Ajustes, sessao, avisos).
@@ -919,12 +921,31 @@ jobs:
           f=./flutter/pubspec.yaml
           fontes='    - family: PlusJakartaSans\n      fonts:\n        - asset: assets/acessofast/fonts/PlusJakartaSans-Regular.ttf\n        - asset: assets/acessofast/fonts/PlusJakartaSans-Medium.ttf\n          weight: 500\n        - asset: assets/acessofast/fonts/PlusJakartaSans-SemiBold.ttf\n          weight: 600\n        - asset: assets/acessofast/fonts/PlusJakartaSans-Bold.ttf\n          weight: 700\n        - asset: assets/acessofast/fonts/PlusJakartaSans-ExtraBold.ttf\n          weight: 800\n    - family: JetBrainsMonoAF\n      fonts:\n        - asset: assets/acessofast/fonts/JetBrainsMono-Medium.ttf\n          weight: 500\n        - asset: assets/acessofast/fonts/JetBrainsMono-Bold.ttf\n          weight: 700'
           troca "$f" "  fonts:" "0,/^  fonts:$/s||  fonts:\n$fontes|"
+          # "- assets/" nao inclui subpastas; o icone do AcessoFast mora em assets/acessofast/.
+          troca "$f" "    - assets/" "0,/^    - assets\/$/s||    - assets/\n    - assets/acessofast/|"
+
+          # Pedido de acesso (quem nao vem pelo painel) na janela nova; as respostas continuam
+          # sendo as do RustDesk (sendLoginResponse). Mesmo padrao do consentimento: corpo + return.
+          f=./flutter/lib/models/server_model.dart
+          troca "$f" "  void showLoginDialog(Client client) {" "s|^  void showLoginDialog(Client client) {|&\n    // AcessoFast: pedido de acesso na janela nova.\n    afPedidoDeAcesso(this, client);\n    return;|"
+          troca "$f" "import 'package:flutter_hbb/consts.dart';" "0,/^import 'package:flutter_hbb\/consts.dart';/s||&\nimport 'package:flutter_hbb/acessofast/ui/pedido.dart';|"
+
+          # Avisos do RustDesk ("Conectando...", senha, erro de conexao) e menus com os textos e o
+          # miolo do AcessoFast, iguais aos do desktop (ui/lib/textos.dart e avisos.dart).
+          f=./flutter/lib/common.dart
+          troca "$f" "String translate(String name) {" "s|^String translate(String name) {|&\n  // AcessoFast: textos proprios por cima da traducao do RustDesk.\n  final af = textoAcessoFast(name);\n  if (af != null) return af;|"
+          troca "$f" "import 'package:flutter_hbb/utils/http_service.dart' as http;" "0,/^import 'package:flutter_hbb\/utils\/http_service.dart' as http;/s||&\nimport 'package:flutter_hbb/acessofast/ui/textos.dart';\nimport 'package:flutter_hbb/acessofast/ui/avisos.dart';|"
+          troca "$f" "TextStyle(fontSize: 21)" "s|TextStyle(fontSize: 21)|TextStyle(fontSize: 17, fontWeight: FontWeight.w700)|g"
+          troca "$f" "return Icon(iconData, size: 50, color: _msgboxColor(type))" "s|return Icon(iconData, size: 50, color: _msgboxColor(type))|return Icon(iconData, size: 34, color: _msgboxColor(type))|"
+          troca "$f" "Widget msgboxContent(String type, String title, String text) {" "s|^Widget msgboxContent(String type, String title, String text) {|Widget msgboxContent(String type, String title, String text) =>\n    AfConteudoAviso(tipo: type, titulo: title, texto: text);\n\n// ignore: unused_element\nWidget _msgboxContentRustDesk(String type, String title, String text) {|"
 
           echo "--- resultado ---"
           grep -n "acessofast\|AfInicioMobile" ./flutter/lib/mobile/pages/home_page.dart ./flutter/lib/main.dart
           grep -n "PlusJakartaSans\|JetBrainsMonoAF" ./flutter/pubspec.yaml | head -3
-          grep -qF 'return AfInicioMobile(' ./flutter/lib/mobile/pages/home_page.dart || { echo "::error::a casca nova nao entrou."; exit 1; }
+          grep -qF 'return const AfInicioMobile();' ./flutter/lib/mobile/pages/home_page.dart || { echo "::error::a casca nova nao entrou."; exit 1; }
           grep -qF 'temaAcessoFast(MyTheme.darkTheme' ./flutter/lib/main.dart || { echo "::error::o tema nao entrou."; exit 1; }
+          grep -qF 'afPedidoDeAcesso(this, client);' ./flutter/lib/models/server_model.dart || { echo "::error::o pedido de acesso nao entrou."; exit 1; }
+          grep -qF 'textoAcessoFast(name)' ./flutter/lib/common.dart || { echo "::error::os textos nao entraram."; exit 1; }
 
       - name: Install flutter
         uses: subosito/flutter-action@v2
@@ -1090,6 +1111,7 @@ jobs:
           flutter build apk --release --target-platform android-arm64 \
             --build-number="${BUILD_NUMBER}" \
             --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}" \
+            --dart-define=ACESSOFAST_PACOTE="${{ env.applicationId }}" \
             --dart-define=ACESSOFAST_CANAL=apk
           popd
           mv ./flutter/build/app/outputs/flutter-apk/app-release.apk "./${OUT_BASE}.apk"
@@ -1161,6 +1183,7 @@ jobs:
           flutter build appbundle --release --target-platform android-arm64 \
             --build-number="${BUILD_NUMBER}" \
             --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}" \
+            --dart-define=ACESSOFAST_PACOTE="${{ env.applicationId }}" \
             --dart-define=ACESSOFAST_CANAL=play
           popd
           mv ./flutter/build/app/outputs/bundle/release/app-release.aab "./${OUT_BASE}.aab"

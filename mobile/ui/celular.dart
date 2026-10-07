@@ -13,6 +13,7 @@ import 'package:provider/provider.dart';
 
 import '../onboarding.dart';
 import 'comum.dart';
+import 'registro.dart';
 import 'tema.dart';
 
 /// Conexões que estão de fato acontecendo (aceitas e ainda abertas).
@@ -157,6 +158,8 @@ class _AfEsteCelularState extends State<AfEsteCelular> with WidgetsBindingObserv
         ]),
         const SizedBox(height: 14),
         _dicaBateria(c),
+        const SizedBox(height: 14),
+        const AfQuemAcessou(),
       ],
     );
   }

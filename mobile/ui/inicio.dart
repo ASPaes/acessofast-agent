@@ -2,8 +2,8 @@
 // atendimento em andamento. Desenho do protótipo aprovado (prototipo-mobile).
 // Copiado pelo CI para flutter/lib/acessofast/ui/ e montado pela HomePage do RustDesk.
 //
-// Etapa 1: Acessar e Ajustes ainda mostram as telas do RustDesk (ConnectionPage e
-// SettingsPage), dentro da nossa casca. Elas são trocadas nas etapas 4 e 8.
+// Também liga o que vale para o app inteiro: o assistente em tela cheia (gancho do
+// onboarding.dart), o registro de quem acessou e o aviso de atualização.
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -14,14 +14,17 @@ import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:provider/provider.dart';
 
+import '../onboarding.dart';
+import 'acessar.dart';
+import 'ajustes.dart';
+import 'assistente.dart';
 import 'celular.dart';
 import 'comum.dart';
+import 'registro.dart';
 import 'tema.dart';
 
 class AfInicioMobile extends StatefulWidget {
-  final Widget acessar;
-  final Widget ajustes;
-  const AfInicioMobile({super.key, required this.acessar, required this.ajustes});
+  const AfInicioMobile({super.key});
 
   @override
   State<AfInicioMobile> createState() => _AfInicioMobileState();
@@ -32,9 +35,22 @@ class _AfInicioMobileState extends State<AfInicioMobile> {
   int _aba = 1;
 
   @override
+  void initState() {
+    super.initState();
+    // O agent.dart abre o assistente 4 s depois de subir; com o gancho preenchido, ele vem na
+    // tela cheia nova em vez do diálogo antigo.
+    acessofastAssistenteNovo = abrirAssistente;
+    unawaited(RegistroAcessos.instancia.ligar());
+    // Depois do assistente ter chance de abrir (ver avisarAtualizacao).
+    Future.delayed(const Duration(milliseconds: 1500), () {
+      if (mounted) unawaited(avisarAtualizacao(context));
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
     final c = AfCores.of(context);
-    final paginas = [widget.acessar, const AfEsteCelular(), widget.ajustes];
+    const paginas = [AfAcessar(), AfEsteCelular(), AfAjustes()];
     return WillPopScope(
       onWillPop: () async {
         if (_aba != 1) {
