@@ -69,12 +69,12 @@ on:
         default: false
         type: boolean
       interface_nova:
-        description: 'Interface nova (mobile/ui) — gera o AcessoFast Beta, que instala ao lado do app da loja'
+        description: 'Interface nova (mobile/ui). Sozinha: gera o AcessoFast Beta, que instala ao lado do app da loja. Com a opcao de baixo: versao da loja'
         required: false
         default: false
         type: boolean
       versao_da_loja:
-        description: 'Com interface_nova: sai no pacote da Play (atualiza o app da loja) em vez do Beta. Usar com gerar_aab.'
+        description: 'Versao da loja: com a interface nova marcada, sai no pacote da Play (atualiza o app da loja). Marque tambem o .aab'
         required: false
         default: false
         type: boolean
