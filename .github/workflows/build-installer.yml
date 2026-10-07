@@ -1,5 +1,5 @@
 name: Build AcessoFast Installer (Windows)
-run-name: "Instalador — agente ${{ inputs.agent_version }}"
+run-name: "Instalador — agente ${{ inputs.agent_version }} app ${{ inputs.app_version }}"
 
 # Monta o AcessoFastSetup.exe (Inno Setup) juntando as tres pecas que ja existem
 # separadas: o SCRIPT (installer/*.iss + installer/branding, versionados aqui), o
@@ -17,8 +17,12 @@ on:
         description: "Tag do release do agente (ex: 2026.08.17-46a6109). Vazio = ultimo release do agente."
         required: false
         default: ""
+      app_version:
+        description: "Versao do app novo (ex: 2026.10.06-e19c2a7), do release app-<versao>. Vazio = ultimo release app-*."
+        required: false
+        default: ""
       client_run_id:
-        description: "Run id do build-client.yml de onde baixar o cliente. Vazio = ultimo build bem-sucedido."
+        description: "SO para voltar ao cliente antigo: run id do build-client.yml. Preenchido, ignora o app_version."
         required: false
         default: ""
 
@@ -74,23 +78,46 @@ jobs:
           }
           "sha256 do agente: $((Get-FileHash installer\payload\acessofast-agent.exe -Algorithm SHA256).Hash)"
 
-      # O cliente branded so existe como artifact do build-client.yml (30 dias de
-      # retencao). Expirou -> rodar o build-client antes; a mensagem diz isso.
-      - name: Baixar o cliente branded
+      # Desde 07/10/2026 o cliente e o APP NOVO (repo acessofast-desktop), o mesmo .exe
+      # que o agente instala pelo atualiza_app.go: release app-<versao> deste repo. Ele
+      # aceita o mesmo --silent-install e grava o custom_.txt, entao o .iss nao muda.
+      # O artifact do build-client.yml (cliente antigo) so entra se client_run_id vier.
+      - name: Baixar o cliente (app novo)
+        if: ${{ inputs.client_run_id == '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ inputs.app_version }}".Trim()
+          if (-not $v) {
+            $v = gh release list --repo $env:GITHUB_REPOSITORY --limit 50 --json tagName `
+                 | ConvertFrom-Json `
+                 | Where-Object { $_.tagName -match '^app-\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7}$' } `
+                 | Select-Object -First 1 -ExpandProperty tagName
+            $v = "$v" -replace '^app-', ''
+          }
+          if (-not $v) { Write-Host "::error::Nenhum release app-* encontrado."; exit 1 }
+          Write-Host "::notice::app=$v"
+          "APP_VERSION=$v" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force -Path installer\payload | Out-Null
+          gh release download "app-$v" --repo $env:GITHUB_REPOSITORY --pattern "AcessoFast-$v.exe" --dir client
+          if (-not (Test-Path "client\AcessoFast-$v.exe")) {
+            Write-Host "::error::Release app-$v nao tem o asset AcessoFast-$v.exe."
+            exit 1
+          }
+          # O .iss espera este nome exato dentro do payload.
+          Copy-Item "client\AcessoFast-$v.exe" installer\payload\AcessoFastClient.exe -Force
+          "sha256 do app: $((Get-FileHash installer\payload\AcessoFastClient.exe -Algorithm SHA256).Hash)"
+
+      # Cliente ANTIGO: so existe como artifact do build-client.yml (30 dias de retencao).
+      - name: Baixar o cliente antigo (build-client)
+        if: ${{ inputs.client_run_id != '' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $runId = "${{ inputs.client_run_id }}".Trim()
-          if (-not $runId) {
-            $runId = gh run list --repo $env:GITHUB_REPOSITORY --workflow build-client.yml `
-                     --status success --limit 1 --json databaseId `
-                     | ConvertFrom-Json | Select-Object -First 1 -ExpandProperty databaseId
-          }
-          if (-not $runId) {
-            Write-Host "::error::Nenhum build-client.yml bem-sucedido. Rode o Build AcessoFast Client (Windows) primeiro (~48 min)."
-            exit 1
-          }
+          "APP_VERSION=cliente antigo (run $runId)" >> $env:GITHUB_ENV
           Write-Host "::notice::cliente vem do run $runId"
           gh run download $runId --repo $env:GITHUB_REPOSITORY -n acessofast-client-windows-x64 --dir client
           $exe = Get-ChildItem client -Recurse -File -Filter *.exe | Select-Object -First 1
@@ -101,6 +128,26 @@ jobs:
           # O .iss espera este nome exato dentro do payload.
           Copy-Item $exe.FullName installer\payload\AcessoFastClient.exe -Force
           "cliente: $($exe.Name) -> AcessoFastClient.exe"
+
+      # Na frota o app novo so foi instalado POR CIMA do antigo (pelo agente). O
+      # instalador do site cai em maquina VAZIA: prova aqui, no runner limpo, que o
+      # --silent-install sozinho cria o servico e grava custom_.txt e a versao -
+      # exatamente o que o .iss confere. So o cliente: o agente faria check-in de
+      # matricula no banco de producao.
+      - name: Testar o cliente em maquina limpa
+        shell: pwsh
+        run: |
+          Start-Process installer\payload\AcessoFastClient.exe -ArgumentList '--silent-install'
+          $dir = 'C:\Program Files\AcessoFast'
+          $ok = $false
+          foreach ($i in 1..60) {
+            Start-Sleep 3
+            $svc = Get-Service AcessoFast -ErrorAction SilentlyContinue
+            if ($svc -and (Test-Path "$dir\custom_.txt") -and (Test-Path "$dir\acessofast-versao.txt")) { $ok = $true; break }
+          }
+          Get-Service AcessoFast -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Write-Host
+          if (-not $ok) { Get-ChildItem $dir -ErrorAction SilentlyContinue | Out-String | Write-Host; Write-Host "::error::--silent-install nao criou servico + custom_.txt + versao em 180s"; exit 1 }
+          Write-Host "::notice::instalado em $($i*3)s, versao $(Get-Content "$dir\acessofast-versao.txt")"
 
       - name: Garantir o Inno Setup
         shell: pwsh
@@ -142,6 +189,7 @@ jobs:
           ## Instalador gerado
 
           - agente embutido: **$env:AGENT_VERSION**
+          - app embutido: **$env:APP_VERSION**
           - baixe em **Artifacts -> acessofast-installer-windows-x64** (no topo desta pagina)
 
           Para publicar no site: crie um release novo (ex.: ``v3.1.1``) com o

@@ -45,7 +45,9 @@
 ; (release 2026.08.15-f602a40, sha256 6d95b4af...e0e0cb). A partir deste
 ; instalador, maquina nova nunca mais precisa de sessao remota so por versao
 ; de agente: ela se declara no painel e obedece ao alvo de update.
-#define MyAppVersion     "3.1.1"
+; 3.2.0 (2026-10-07): o cliente passa a ser o APP NOVO (release app-<versao>, o mesmo
+; que o agente instala na frota). Espera da instalacao por conferencia, nao por tempo.
+#define MyAppVersion     "3.2.0"
 #define MyAppPublisher   "AcessoFast"
 #define MyAppURL         "https://acessofast.com.br"
 #define AgentServiceName "AcessoFastAgent"
@@ -127,7 +129,7 @@ const
   CLIENTE_CUSTOM = 'C:\Program Files\AcessoFast\custom_.txt';
 
   SVC_TIMEOUT      = 60;   { segundos aguardando o servico do cliente subir }
-  POS_INSTALL_WAIT = 25;   { o --silent-install NAO retorna; aguarda antes de olhar }
+  POS_INSTALL_WAIT = 120;  { o --silent-install NAO retorna; teto da espera pela instalacao }
 
 { --------------------------------------------------------------------------
   Passo 1 — Cliente branded silencioso, como Servico Windows
@@ -163,7 +165,7 @@ end;
 
 { O --silent-install NAO retorna: dispara, aguarda por tempo, depois confere o servico. }
 function InstalarCliente(): Boolean;
-var ResultCode: Integer; Setup: String;
+var ResultCode, Elapsed: Integer; Setup: String;
 begin
   Result := False;
   ExtractTemporaryFile('{#ClientExe}');
@@ -174,7 +176,18 @@ begin
     Log('Falha ao disparar o instalador do cliente AcessoFast.');
     Exit;
   end;
-  Sleep(POS_INSTALL_WAIT * 1000);
+  { Os 25s de antes continuam como minimo (por cima de uma instalacao existente o
+    servico e o custom_.txt ja estao la desde o inicio). O app novo e maior que o
+    cliente antigo: depois disso espera o servico e o custom_.txt, ate POS_INSTALL_WAIT. }
+  Sleep(25000);
+  Elapsed := 25;
+  while (Elapsed < POS_INSTALL_WAIT) and
+        not (ServicoExiste(CLIENTE_SVC) and FileExists(CLIENTE_CUSTOM)) do
+  begin
+    Sleep(3000);
+    Elapsed := Elapsed + 3;
+  end;
+  Sleep(5000);
 
   { Fallback: se o silent-install nao registrou o servico, forca. }
   if not ServicoExiste(CLIENTE_SVC) then
