@@ -68,6 +68,16 @@ on:
         required: false
         default: false
         type: boolean
+      interface_nova:
+        description: 'Interface nova (mobile/ui) — gera o AcessoFast Beta, que instala ao lado do app da loja'
+        required: false
+        default: false
+        type: boolean
+      versao_da_loja:
+        description: 'Com interface_nova: sai no pacote da Play (atualiza o app da loja) em vez do Beta. Usar com gerar_aab.'
+        required: false
+        default: false
+        type: boolean
 
 env:
   RUST_VERSION: "1.75"
@@ -80,7 +90,11 @@ env:
   VERSION: "${{ inputs.version }}"
 
   # ---------------- Identidade AcessoFast (igual ao build Windows) ------------
-  appname: "AcessoFast"
+  # Com interface_nova o app sai como "AcessoFast Beta", com pacote proprio (.beta): instala
+  # ao lado do app da loja, com dados e ID separados, sem mexer nele. Com versao_da_loja junto,
+  # a interface nova sai no pacote da Play: e assim que ela vai para a loja (aprovada no Beta
+  # em 07/10/2026).
+  appname: "${{ inputs.interface_nova && !inputs.versao_da_loja && 'AcessoFast Beta' || 'AcessoFast' }}"
   compname: "AcessoFast"
 
   # applicationId do APK. TROCADO de propósito: o upstream usa
@@ -90,7 +104,7 @@ env:
   # necessidade tecnica, ja que o client desktop nao tem applicationId.
   # ATENCAO: depois de publicado, applicationId NUNCA MAIS MUDA. Confirmar antes
   # do primeiro APK que sair pra cliente.
-  applicationId: "br.com.aspsoftwares.acessofast.mobile"
+  applicationId: "${{ inputs.interface_nova && !inputs.versao_da_loja && 'br.com.aspsoftwares.acessofast.mobile.beta' || 'br.com.aspsoftwares.acessofast.mobile' }}"
 
   # ---------------- Plano de dados: relay proprio -----------------------------
   server: "${{ vars.RELAY_HOST }}"
@@ -166,6 +180,26 @@ jobs:
           [ -f ./mobile/session.dart ] || { echo "::error::mobile/session.dart ausente."; exit 1; }
           echo "branding e agente ok."
 
+      - name: Interface nova (Beta ou loja)
+        if: ${{ inputs.interface_nova || inputs.versao_da_loja }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.versao_da_loja }}" = "true" ] && [ "${{ inputs.interface_nova }}" != "true" ]; then
+            echo "::error::versao_da_loja so vale junto com interface_nova."
+            exit 1
+          fi
+          # O Beta tem outro pacote: um .aab dele subiria para a Play como app novo.
+          if [ "${{ inputs.gerar_aab }}" = "true" ] && [ "${{ inputs.versao_da_loja }}" != "true" ]; then
+            echo "::error::interface_nova sem versao_da_loja gera o AcessoFast Beta, que nao vai para a Play. Marque versao_da_loja ou desmarque gerar_aab."
+            exit 1
+          fi
+          for f in inicio.dart celular.dart comum.dart tema.dart painel.dart textos.dart avisos.dart \
+                   assistente.dart pedido.dart acessar.dart ajustes.dart registro.dart; do
+            [ -f "./mobile/ui/$f" ] || { echo "::error::mobile/ui/$f ausente."; exit 1; }
+          done
+          echo "interface nova ok."
+
   generate-bridge:
     needs: preflight
     uses: ./.github/workflows/bridge.yml
@@ -217,6 +251,8 @@ jobs:
           # agent.dart precisa sobreviver ao checkout do rustdesk pelo mesmo
           # motivo do branding: o checkout sobrescreve o workspace inteiro.
           cp ./mobile/agent.dart ./mobile/onboarding.dart ./mobile/session.dart "$RUNNER_TEMP/af-agent/"
+          # Interface nova (so usada com interface_nova; copiar sempre nao custa nada).
+          cp -r ./mobile/ui "$RUNNER_TEMP/af-agent/ui"
           echo "AF_BRANDING=$RUNNER_TEMP/af-branding" >> "$GITHUB_ENV"
           echo "AF_AGENT=$RUNNER_TEMP/af-agent" >> "$GITHUB_ENV"
           ls -la "$RUNNER_TEMP/af-branding" "$RUNNER_TEMP/af-agent"
@@ -860,6 +896,68 @@ jobs:
             exit 1
           fi
 
+      # INTERFACE NOVA (PLANO-MOBILE.md do acessofast-desktop). So com
+      # interface_nova: o app da loja continua saindo com as telas de hoje. Mesma regra do
+      # desktop: trocamos so widgets. A HomePage do RustDesk continua montada (o
+      # HomePage.homeKey e usado pelo chat e pelas configuracoes), mas desenha a nossa casca;
+      # ServerModel, ConnectionPage e SettingsPage seguem os do RustDesk.
+      - name: Interface nova (mobile/ui -> flutter/lib/acessofast/ui)
+        if: ${{ inputs.interface_nova }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          troca() {
+            grep -qF -- "$2" "$1" || { echo "::error::ancora '$2' nao encontrada em $1 (o RustDesk mudou?)"; exit 1; }
+            sed -i -e "$3" "$1"
+          }
+          rm -rf ./flutter/lib/acessofast/ui ./flutter/assets/acessofast
+          mkdir -p ./flutter/lib/acessofast/ui ./flutter/assets/acessofast
+          cp "$AF_AGENT"/ui/*.dart ./flutter/lib/acessofast/ui/
+          cp -r "$AF_AGENT/ui/assets/fonts" ./flutter/assets/acessofast/fonts
+          cp "$AF_BRANDING/icon.png" ./flutter/assets/acessofast/icon.png
+          ls -la ./flutter/lib/acessofast/ui ./flutter/assets/acessofast/fonts
+
+          # Casca nova no lugar das abas do RustDesk.
+          f=./flutter/lib/mobile/pages/home_page.dart
+          troca "$f" "import 'connection_page.dart';" "s|^import 'connection_page.dart';|&\nimport 'package:flutter_hbb/acessofast/ui/inicio.dart';|"
+          troca "$f" "  Widget build(BuildContext context) {" "0,/^  Widget build(BuildContext context) {$/s||&\n    // AcessoFast: interface nova.\n    return const AfInicioMobile();\n    // ignore: dead_code|"
+
+          # Cores e fonte do AcessoFast por cima do tema do RustDesk (vale para as telas antigas
+          # que ainda aparecem: Acessar, Ajustes, sessao, avisos).
+          f=./flutter/lib/main.dart
+          troca "$f" "theme: MyTheme.lightTheme," "s|theme: MyTheme.lightTheme,|theme: temaAcessoFast(MyTheme.lightTheme, escuro: false),|; s|darkTheme: MyTheme.darkTheme,|darkTheme: temaAcessoFast(MyTheme.darkTheme, escuro: true),|"
+          troca "$f" "import 'package:flutter_hbb/models/state_model.dart';" "s|^import 'package:flutter_hbb/models/state_model.dart';|&\nimport 'package:flutter_hbb/acessofast/ui/tema.dart';|"
+
+          # Fontes embutidas (o app nao depende de internet para desenhar texto).
+          f=./flutter/pubspec.yaml
+          fontes='    - family: PlusJakartaSans\n      fonts:\n        - asset: assets/acessofast/fonts/PlusJakartaSans-Regular.ttf\n        - asset: assets/acessofast/fonts/PlusJakartaSans-Medium.ttf\n          weight: 500\n        - asset: assets/acessofast/fonts/PlusJakartaSans-SemiBold.ttf\n          weight: 600\n        - asset: assets/acessofast/fonts/PlusJakartaSans-Bold.ttf\n          weight: 700\n        - asset: assets/acessofast/fonts/PlusJakartaSans-ExtraBold.ttf\n          weight: 800\n    - family: JetBrainsMonoAF\n      fonts:\n        - asset: assets/acessofast/fonts/JetBrainsMono-Medium.ttf\n          weight: 500\n        - asset: assets/acessofast/fonts/JetBrainsMono-Bold.ttf\n          weight: 700'
+          troca "$f" "  fonts:" "0,/^  fonts:$/s||  fonts:\n$fontes|"
+          # "- assets/" nao inclui subpastas; o icone do AcessoFast mora em assets/acessofast/.
+          troca "$f" "    - assets/" "0,/^    - assets\/$/s||    - assets/\n    - assets/acessofast/|"
+
+          # Pedido de acesso (quem nao vem pelo painel) na janela nova; as respostas continuam
+          # sendo as do RustDesk (sendLoginResponse). Mesmo padrao do consentimento: corpo + return.
+          f=./flutter/lib/models/server_model.dart
+          troca "$f" "  void showLoginDialog(Client client) {" "s|^  void showLoginDialog(Client client) {|&\n    // AcessoFast: pedido de acesso na janela nova.\n    afPedidoDeAcesso(this, client);\n    return;|"
+          troca "$f" "import 'package:flutter_hbb/consts.dart';" "0,/^import 'package:flutter_hbb\/consts.dart';/s||&\nimport 'package:flutter_hbb/acessofast/ui/pedido.dart';|"
+
+          # Avisos do RustDesk ("Conectando...", senha, erro de conexao) e menus com os textos e o
+          # miolo do AcessoFast, iguais aos do desktop (ui/lib/textos.dart e avisos.dart).
+          f=./flutter/lib/common.dart
+          troca "$f" "String translate(String name) {" "s|^String translate(String name) {|&\n  // AcessoFast: textos proprios por cima da traducao do RustDesk.\n  final af = textoAcessoFast(name);\n  if (af != null) return af;|"
+          troca "$f" "import 'package:flutter_hbb/utils/http_service.dart' as http;" "0,/^import 'package:flutter_hbb\/utils\/http_service.dart' as http;/s||&\nimport 'package:flutter_hbb/acessofast/ui/textos.dart';\nimport 'package:flutter_hbb/acessofast/ui/avisos.dart';|"
+          troca "$f" "TextStyle(fontSize: 21)" "s|TextStyle(fontSize: 21)|TextStyle(fontSize: 17, fontWeight: FontWeight.w700)|g"
+          troca "$f" "return Icon(iconData, size: 50, color: _msgboxColor(type))" "s|return Icon(iconData, size: 50, color: _msgboxColor(type))|return Icon(iconData, size: 34, color: _msgboxColor(type))|"
+          troca "$f" "Widget msgboxContent(String type, String title, String text) {" "s|^Widget msgboxContent(String type, String title, String text) {|Widget msgboxContent(String type, String title, String text) =>\n    AfConteudoAviso(tipo: type, titulo: title, texto: text);\n\n// ignore: unused_element\nWidget _msgboxContentRustDesk(String type, String title, String text) {|"
+
+          echo "--- resultado ---"
+          grep -n "acessofast\|AfInicioMobile" ./flutter/lib/mobile/pages/home_page.dart ./flutter/lib/main.dart
+          grep -n "PlusJakartaSans\|JetBrainsMonoAF" ./flutter/pubspec.yaml | head -3
+          grep -qF 'return const AfInicioMobile();' ./flutter/lib/mobile/pages/home_page.dart || { echo "::error::a casca nova nao entrou."; exit 1; }
+          grep -qF 'temaAcessoFast(MyTheme.darkTheme' ./flutter/lib/main.dart || { echo "::error::o tema nao entrou."; exit 1; }
+          grep -qF 'afPedidoDeAcesso(this, client);' ./flutter/lib/models/server_model.dart || { echo "::error::o pedido de acesso nao entrou."; exit 1; }
+          grep -qF 'textoAcessoFast(name)' ./flutter/lib/common.dart || { echo "::error::os textos nao entraram."; exit 1; }
+
       - name: Install flutter
         uses: subosito/flutter-action@v2
         with:
@@ -1011,7 +1109,7 @@ jobs:
 
           # Nome dos arquivos: tag como esta; commit encurtado pra 7.
           if [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]]; then LABEL="${VERSION:0:7}"; else LABEL="$VERSION"; fi
-          OUT_BASE="AcessoFast-${LABEL}-${{ matrix.job.arch }}"
+          OUT_BASE="AcessoFast${{ inputs.interface_nova && !inputs.versao_da_loja && 'Beta' || '' }}-${LABEL}-${{ matrix.job.arch }}"
           echo "OUT_BASE=${OUT_BASE}" >> "$GITHUB_ENV"
 
           # SEM --split-per-abi: com ele o Flutter reescreve o versionCode do APK
@@ -1024,6 +1122,7 @@ jobs:
           flutter build apk --release --target-platform android-arm64 \
             --build-number="${BUILD_NUMBER}" \
             --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}" \
+            --dart-define=ACESSOFAST_PACOTE="${{ env.applicationId }}" \
             --dart-define=ACESSOFAST_CANAL=apk
           popd
           mv ./flutter/build/app/outputs/flutter-apk/app-release.apk "./${OUT_BASE}.apk"
@@ -1095,6 +1194,7 @@ jobs:
           flutter build appbundle --release --target-platform android-arm64 \
             --build-number="${BUILD_NUMBER}" \
             --dart-define=ACESSOFAST_VERSION="${AGENT_VERSION}" \
+            --dart-define=ACESSOFAST_PACOTE="${{ env.applicationId }}" \
             --dart-define=ACESSOFAST_CANAL=play
           popd
           mv ./flutter/build/app/outputs/bundle/release/app-release.aab "./${OUT_BASE}.aab"

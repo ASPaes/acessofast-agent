@@ -212,11 +212,25 @@ void acessofastConsentimentoControle(FFI ffi) {
   });
 }
 
+/// Assistente da interface nova (mobile/ui/assistente.dart), em tela cheia. Só é preenchido
+/// no AcessoFast Beta (build com interface_nova); no app da loja fica null e vale o diálogo
+/// abaixo. A marca de concluído continua sendo esta daqui, que o session.dart também lê.
+Future<void> Function()? acessofastAssistenteNovo;
+
 /// Mostra o assistente. `forcar: true` ignora a marca de já exibido — usado
 /// quando o técnico quiser reabrir o passo a passo no aparelho do cliente.
 Future<void> showAcessofastOnboarding({bool forcar = false}) async {
   try {
     if (!forcar && await _alreadyShown()) return;
+
+    final novo = acessofastAssistenteNovo;
+    if (novo != null) {
+      await novo();
+      // Marca mesmo se pulou, pelo mesmo motivo do diálogo antigo: insistir a cada abertura
+      // irrita, e dá para reabrir pela tela Este celular.
+      await _markShown();
+      return;
+    }
 
     final sm = gFFI.serverModel;
 
