@@ -497,6 +497,25 @@ jobs:
           sed -i -e 's|applicationId "com.carriez.flutter_hbb"|applicationId "${{ env.applicationId }}"|' "$f"
           grep -n 'applicationId' "$f"
 
+      # Android 7.0 (API 24) como minimo. A "Protecao Automatica" do Google Play recusa o .aab
+      # com minSdk abaixo de 24, e o RustDesk vem com 22 (Android 5.1). Descoberto em 08/10/2026
+      # no envio da versao com a interface nova (versionCode 3150); o 3130 tinha passado antes de
+      # a protecao ser ligada. Fica de fora so Android 5.1 e 6, de 2015.
+      - name: minSdk 24 (Protecao Automatica da Play)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=./flutter/android/app/build.gradle
+          if ! grep -qE '^\s*minSdkVersion [0-9]+' "$f"; then
+            echo "::error::minSdkVersion nao encontrado em $f (o RustDesk mudou o build.gradle?)."
+            exit 1
+          fi
+          atual=$(grep -oE '^\s*minSdkVersion [0-9]+' "$f" | grep -oE '[0-9]+' | head -1)
+          if [ "$atual" -lt 24 ]; then
+            sed -i -E 's|^(\s*)minSdkVersion [0-9]+|\1minSdkVersion 24|' "$f"
+          fi
+          grep -n 'minSdkVersion' "$f"
+
       # O NOME QUE O USUARIO VE VEM DAQUI — nao do read_custom_client.
       # Descoberto no run #2: o APK instalou como "RustDesk" mesmo com a
       # identidade injetada corretamente. Sao camadas diferentes:
