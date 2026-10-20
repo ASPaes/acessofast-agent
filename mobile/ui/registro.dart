@@ -157,7 +157,13 @@ class NovidadeApp {
   const NovidadeApp(this.data, this.itens);
 }
 
-const novidadesCelular = <NovidadeApp>[];
+const novidadesCelular = <NovidadeApp>[
+  NovidadeApp('2026.10.20', [
+    'Conheça o Otto, o mascote do AcessoFast: em Este celular ele mostra se o celular está pronto, sendo acessado ou se falta alguma coisa.',
+    'Em Acessar, o Otto acompanha a conexão e, se não der certo, mostra o motivo e deixa tentar de novo.',
+    'O status de cada computador vem com a carinha do Otto.',
+  ]),
+];
 
 /// Para quem vem do AcessoFast de antes (primeira abertura com a interface nova).
 const boasVindasCelular = <String>[

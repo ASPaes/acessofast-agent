@@ -13,8 +13,16 @@ import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 
 import 'comum.dart';
+import 'otto.dart';
 import 'painel.dart';
 import 'tema.dart';
+
+/// O Otto mini de cada computador da empresa, pelo status que vem do painel.
+OttoStatus ottoDoStatus(ComputadorEmpresa d) => switch (d.status) {
+      'atendimento' => OttoStatus.atendimento,
+      'sem_status' => OttoStatus.semStatus,
+      _ => d.online ? OttoStatus.online : OttoStatus.offline,
+    };
 
 // Cores dos marcadores: as mesmas 8 do painel, no tom do protótipo (igual ao empresa.dart do desktop).
 Color corDoMarcador(BuildContext context, String cor) {
@@ -489,8 +497,9 @@ class _AfAcessarState extends State<AfAcessar> {
                   Row(children: [
                     const Expanded(child: AfMiudo('Situação')),
                     d.online
-                        ? AfSelo(d.status == 'atendimento' ? 'Em atendimento' : 'Ligado', tom: d.status == 'atendimento' ? AfTom.live : AfTom.ok)
-                        : const AfSelo('Desligado', tom: AfTom.off),
+                        ? AfSelo(d.status == 'atendimento' ? 'Em atendimento' : 'Ligado',
+                            tom: d.status == 'atendimento' ? AfTom.live : AfTom.ok, otto: ottoDoStatus(d))
+                        : const AfSelo('Desligado', tom: AfTom.off, otto: OttoStatus.offline),
                   ]),
                   if (ids.isNotEmpty) ...[
                     const SizedBox(height: 10),
@@ -537,8 +546,9 @@ class _AfAcessarState extends State<AfAcessar> {
 
   /// Igual ao desktop e ao botão Conectar do painel. No celular a conta medida sempre usa
   /// crédito: se o painel pedir para escolher, a escolha já está feita.
-  Future<void> _conectar(BuildContext folha, ComputadorEmpresa d, {bool arquivos = false}) async {
-    Navigator.of(folha).pop();
+  Future<void> _conectar(BuildContext folha, ComputadorEmpresa d, {bool arquivos = false, bool semFolha = false}) async {
+    // semFolha: "Tentar de novo" vem da janela de falha, que já fechou; não há folha aberta.
+    if (!semFolha) Navigator.of(folha).pop();
     final medida = _painel.carteira?.medida == true && _painel.perfil?.empresaId != null;
     final c = AfCores.of(context);
     showDialog(
@@ -549,8 +559,8 @@ class _AfAcessarState extends State<AfAcessar> {
           padding: const EdgeInsets.all(22),
           decoration: BoxDecoration(color: c.side, borderRadius: BorderRadius.circular(20), border: Border.all(color: c.line2)),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
-            const AfSelo('Conectando', tom: AfTom.live, pulsando: true),
-            const SizedBox(height: 10),
+            const Otto(estado: OttoEstado.conectando, tamanho: 84),
+            const SizedBox(height: 6),
             Text(d.nome, style: TextStyle(fontFamily: kFonte, fontSize: 17, fontWeight: FontWeight.w800, color: c.text, decoration: TextDecoration.none)),
           ]),
         ),
@@ -574,11 +584,49 @@ class _AfAcessarState extends State<AfAcessar> {
       unawaited(_carregarLocais());
     } on ErroPainel catch (e) {
       fechar();
-      showToast(e.mensagem);
+      _falhou(d, e.mensagem, arquivos);
     } catch (_) {
       fechar();
-      showToast('Não foi possível falar com o painel. Confira a internet e tente de novo.');
+      _falhou(d, 'Não foi possível falar com o painel. Confira a internet e tente de novo.', arquivos);
     }
+  }
+
+  /// Não deu para conectar: o Otto fica triste, diz o motivo e oferece tentar de novo.
+  void _falhou(ComputadorEmpresa d, String motivo, bool arquivos) {
+    if (!mounted) return;
+    final c = AfCores.of(context);
+    showDialog(
+      context: context,
+      builder: (dlg) => Center(
+        child: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 24),
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(color: c.side, borderRadius: BorderRadius.circular(20), border: Border.all(color: c.line2)),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Otto(estado: OttoEstado.erro, tamanho: 84),
+            const SizedBox(height: 6),
+            Text('Não deu para conectar em ${d.nome}',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontFamily: kFonte, fontSize: 17, fontWeight: FontWeight.w800, color: c.text, decoration: TextDecoration.none)),
+            const SizedBox(height: 6),
+            Text(motivo,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontFamily: kFonte, fontSize: 13.5, height: 1.4, color: c.text2, decoration: TextDecoration.none)),
+            const SizedBox(height: 16),
+            Row(children: [
+              Expanded(child: AfBotao('Fechar', largo: true, onTap: () => Navigator.of(dlg).pop())),
+              const SizedBox(width: 10),
+              Expanded(
+                child: AfBotao('Tentar de novo', estilo: AfEstiloBotao.primario, largo: true, onTap: () {
+                  Navigator.of(dlg).pop();
+                  _conectar(context, d, arquivos: arquivos, semFolha: true);
+                }),
+              ),
+            ]),
+          ]),
+        ),
+      ),
+    );
   }
 
   Future<void> _entrar(BuildContext context) async {
@@ -730,26 +778,15 @@ class _IconePc extends StatelessWidget {
     return SizedBox(
       width: 42,
       height: 42,
-      child: Stack(children: [
+      child: Stack(clipBehavior: Clip.none, children: [
         Container(
           width: 40,
           height: 40,
           decoration: BoxDecoration(color: c.surface2, borderRadius: BorderRadius.circular(12)),
           child: Icon(iconeDoSistema(d.os), size: 20, color: c.text2),
         ),
-        Positioned(
-          right: 0,
-          bottom: 0,
-          child: Container(
-            width: 12,
-            height: 12,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: d.status == 'atendimento' ? c.cyan : (d.online ? c.ok : c.muted),
-              border: Border.all(color: c.surface, width: 2),
-            ),
-          ),
-        ),
+        // o Otto mini no canto, com a cara do status (igual ao painel)
+        Positioned(right: -5, bottom: -5, child: OttoMini(status: ottoDoStatus(d), tamanho: 18)),
       ]),
     );
   }

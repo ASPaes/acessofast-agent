@@ -2,6 +2,7 @@
 // (acessofast-desktop/prototipo-mobile/app.css). Copiado pelo CI para flutter/lib/acessofast/ui/.
 import 'package:flutter/material.dart';
 
+import 'otto.dart';
 import 'tema.dart';
 
 /// Cartão de fundo `surface` com borda fina (.card).
@@ -49,7 +50,9 @@ class AfSelo extends StatefulWidget {
   final String texto;
   final AfTom tom;
   final bool pulsando;
-  const AfSelo(this.texto, {super.key, required this.tom, this.pulsando = false});
+  /// Status de um computador: o Otto mini no lugar do pontinho (igual ao painel).
+  final OttoStatus? otto;
+  const AfSelo(this.texto, {super.key, required this.tom, this.pulsando = false, this.otto});
 
   @override
   State<AfSelo> createState() => _AfSeloState();
@@ -86,10 +89,13 @@ class _AfSeloState extends State<AfSelo> with SingleTickerProviderStateMixin {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(color: fundo, borderRadius: BorderRadius.circular(99)),
       child: Row(mainAxisSize: MainAxisSize.min, children: [
-        FadeTransition(
-          opacity: widget.pulsando ? Tween(begin: 1.0, end: 0.35).animate(_a) : const AlwaysStoppedAnimation(1),
-          child: Container(width: 7, height: 7, decoration: BoxDecoration(color: cor, shape: BoxShape.circle)),
-        ),
+        if (widget.otto != null)
+          OttoMini(status: widget.otto!, tamanho: 15)
+        else
+          FadeTransition(
+            opacity: widget.pulsando ? Tween(begin: 1.0, end: 0.35).animate(_a) : const AlwaysStoppedAnimation(1),
+            child: Container(width: 7, height: 7, decoration: BoxDecoration(color: cor, shape: BoxShape.circle)),
+          ),
         const SizedBox(width: 6),
         Text(widget.texto, style: TextStyle(fontFamily: kFonte, fontSize: 12, fontWeight: FontWeight.w700, color: cor)),
       ]),

@@ -10,6 +10,7 @@ import 'dart:ui' show ImageFilter;
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart' show translate;
 
+import 'otto.dart';
 import 'tema.dart';
 
 /// Mesma regra do translateText do msgboxContent original: "Failed to x: y" traduz por partes e
@@ -67,10 +68,23 @@ class _AfConteudoAvisoState extends State<AfConteudoAviso> {
     return null;
   }
 
+  /// O Otto com a cara do aviso: triste no erro, em dúvida esperando alguém (aceite, UAC),
+  /// feliz no sucesso. Aviso que não é nenhum desses fica sem ele, como ficava sem ícone.
+  OttoEstado? _otto() {
+    if (tipo.contains('error') || tipo == 're-input-password') return OttoEstado.erro;
+    if (tipo.contains('success')) return OttoEstado.concluido;
+    if (tipo == 'wait-uac' || tipo == 'wait-remote-accept-nook' || tipo == 'on-uac' || tipo == 'on-foreground-elevated') {
+      return OttoEstado.aguardando;
+    }
+    if (tipo.contains('info')) return OttoEstado.parado;
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = AfCores.of(context);
     final icone = _icone(c);
+    final otto = _otto();
     final t = translate(titulo);
     final corpo = _traduzir(texto);
     return ConstrainedBox(
@@ -78,7 +92,10 @@ class _AfConteudoAvisoState extends State<AfConteudoAviso> {
       child: Padding(
         padding: const EdgeInsets.only(bottom: 4),
         child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          if (icone != null) ...[
+          if (otto != null) ...[
+            Transform.translate(offset: const Offset(-6, -8), child: Otto(estado: otto, tamanho: 60)),
+            const SizedBox(width: 6),
+          ] else if (icone != null) ...[
             Container(
               width: 38,
               height: 38,
@@ -104,6 +121,17 @@ class _AfConteudoAvisoState extends State<AfConteudoAviso> {
       ),
     );
   }
+}
+
+// ==================================================================== conectando
+
+/// O "Conectando…" do RustDesk (showLoading, também no "Entrando…" e no "Aguardando" dos
+/// arquivos): o Otto conectando no lugar do círculo girando. Ver patches em preparar.sh.
+class AfCarregando extends StatelessWidget {
+  const AfCarregando({super.key});
+
+  @override
+  Widget build(BuildContext context) => const Otto(estado: OttoEstado.conectando, tamanho: 84);
 }
 
 // ==================================================================== fundo da sessão sem imagem

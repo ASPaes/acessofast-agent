@@ -13,6 +13,7 @@ import 'package:provider/provider.dart';
 
 import '../onboarding.dart';
 import 'comum.dart';
+import 'otto.dart';
 import 'registro.dart';
 import 'tema.dart';
 
@@ -68,18 +69,23 @@ class _AfEsteCelularState extends State<AfEsteCelular> with WidgetsBindingObserv
     final faltam = (faltaTela ? 1 : 0) + (faltaControle ? 1 : 0);
     final id = sm.serverId.text;
 
-    final AfSelo selo;
-    if (emAtendimento) {
-      selo = const AfSelo('Sendo acessado', tom: AfTom.live, pulsando: true);
-    } else if (!sm.isStart) {
-      selo = const AfSelo('Desligado', tom: AfTom.off);
-    } else if (faltam > 0) {
-      selo = const AfSelo('Falta permissão', tom: AfTom.warn);
-    } else if (sm.connectStatus != 1) {
-      selo = const AfSelo('Conectando ao servidor', tom: AfTom.warn, pulsando: true);
-    } else {
-      selo = const AfSelo('Pronto para receber acesso', tom: AfTom.ok);
-    }
+    // O Otto diz como este celular está, com a cara de cada situação (igual ao protótipo).
+    final (cara, cor, texto) = emAtendimento
+        ? (OttoEstado.atendendo, c.cyan, 'Sendo acessado')
+        : !sm.isStart
+            ? (OttoEstado.offline, c.muted, 'Desligado')
+            : faltam > 0
+                ? (OttoEstado.aguardando, c.warn, 'Falta permissão')
+                : sm.connectStatus == -1
+                    ? (OttoEstado.offline, c.muted, 'Sem conexão com o servidor')
+                    : sm.connectStatus != 1
+                        ? (OttoEstado.conectando, c.warn, 'Conectando ao servidor')
+                        : (OttoEstado.ola, c.ok, 'Pronto para receber acesso');
+    final selo = Row(children: [
+      Otto(estado: cara, tamanho: 54),
+      const SizedBox(width: 10),
+      Expanded(child: Text(texto, style: TextStyle(fontFamily: kFonte, fontSize: 14, fontWeight: FontWeight.w700, color: cor))),
+    ]);
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(18, 8, 18, 24),

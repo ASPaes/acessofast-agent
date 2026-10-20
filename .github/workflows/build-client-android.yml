@@ -968,6 +968,8 @@ jobs:
           troca "$f" "TextStyle(fontSize: 21)" "s|TextStyle(fontSize: 21)|TextStyle(fontSize: 17, fontWeight: FontWeight.w700)|g"
           troca "$f" "return Icon(iconData, size: 50, color: _msgboxColor(type))" "s|return Icon(iconData, size: 50, color: _msgboxColor(type))|return Icon(iconData, size: 34, color: _msgboxColor(type))|"
           troca "$f" "Widget msgboxContent(String type, String title, String text) {" "s|^Widget msgboxContent(String type, String title, String text) {|Widget msgboxContent(String type, String title, String text) =>\n    AfConteudoAviso(tipo: type, titulo: title, texto: text);\n\n// ignore: unused_element\nWidget _msgboxContentRustDesk(String type, String title, String text) {|"
+          # "Conectando..." (showLoading): o Otto conectando no lugar do circulo girando (avisos.dart).
+          troca "$f" "const Center(child: CircularProgressIndicator())," "s|const Center(child: CircularProgressIndicator()),|const Center(child: AfCarregando()),|"
 
           echo "--- resultado ---"
           grep -n "acessofast\|AfInicioMobile" ./flutter/lib/mobile/pages/home_page.dart ./flutter/lib/main.dart
