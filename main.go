@@ -489,6 +489,9 @@ func (t *tailer) marcaAutenticada(motivo string) {
 	}
 	t.autenticada = true
 	logln(">>> sessao autenticada (%s) — a senha efemera sera girada no fim", motivo)
+	// Ja aqui, e nao so no heartbeat: o tecnico pode reiniciar a maquina segundos depois
+	// de entrar (reboot_em_acesso.go).
+	t.renovaHold()
 }
 
 // autenticaPorTempo marca a sessao pelas conexoes AINDA abertas que ja passaram do
@@ -960,6 +963,7 @@ func worker(stop <-chan struct{}) {
 			t.checkSessaoViva()    // fantasma: #N preso sem socket de sessao -> encerra
 			t.checkGrace()         // §3.1: fecha a sessao adiada quando a carencia expira
 			t.checkHardCap()       // B2: corta o free ao vencer o cap de 2h
+			acessoAberto.Store(len(t.open) > 0)
 		case <-hbT.C:
 			if len(t.open) > 0 {
 				// Re-arma o cap se a resposta trouxer hard_cap_at; falha transitoria de
@@ -967,6 +971,7 @@ func worker(stop <-chan struct{}) {
 				if hc := postEvent("heartbeat", ""); !hc.IsZero() {
 					t.hardCapUntil = hc
 				}
+				t.renovaHold() // reiniciou no meio do acesso -> a senha espera o tecnico
 			}
 		case <-presT.C:
 			// Durante a carencia (§3.1) a sessao ainda nao terminou de fato -> nao

@@ -58,13 +58,15 @@ const (
 	// estourar, nao rotacionamos — o restart do cliente re-sincroniza depois.
 	esperaClienteTick   = 3 * time.Second
 	esperaClienteLimite = 5 * time.Minute
-
-	// holdFile (§4.3): "hold de manutencao". Timestamp RFC3339; enquanto now<hold_until,
-	// o rotate-on-boot (§3.2) e suprimido (reboot planejado — a sessao pode voltar
-	// sozinha). Ausente/ilegivel/expirado = sem hold. O caminho painel->agente que
-	// ESCREVE este arquivo e trabalho do §4.3; aqui o agente apenas LE.
-	holdFile = baseDir + `\hold.until`
 )
+
+// holdFile (§4.3): "hold de manutencao". Timestamp RFC3339; enquanto now<hold_until,
+// o rotate-on-boot (§3.2) e adiado (a maquina reiniciou no meio de um acesso e o
+// tecnico esta voltando com a mesma senha). Ausente/ilegivel/expirado = sem hold. Quem
+// ESCREVE e o proprio agente, enquanto ha acesso autenticado aberto — ver
+// reboot_em_acesso.go. Var, e nao const, para os testes apontarem para um diretorio
+// temporario.
+var holdFile = baseDir + `\hold.until`
 
 // Politica de senha — ESPELHA provision-device-secret (alfabeto sem ambiguos 0 O 1 l I).
 const (
@@ -251,6 +253,8 @@ func rotateNow() {
 		logln("ROTATE ABORT: --password falhou: %v (senha antiga mantida)", err)
 		return
 	}
+	// A senha que o hold segurava para o tecnico voltar acabou de morrer.
+	apagaHold()
 
 	// 2) a senha nova JA esta no endpoint -> registra a pendencia antes de reportar,
 	//    pra sobreviver a crash/queda de rede entre aplicar e confirmar.
@@ -271,9 +275,9 @@ func rotateNow() {
 	}
 }
 
-// holdActive: true se ha um "hold de manutencao" vigente (§4.3) — o operador sinalizou
-// um reboot planejado e nao queremos rotacionar no boot (a sessao pode voltar sozinha
-// dentro da janela). O hold e um timestamp RFC3339 em holdFile. Ausente/ilegivel/
+// holdActive: true se ha um "hold de manutencao" vigente (§4.3) — a maquina reiniciou no
+// meio de um acesso e nao queremos rotacionar no boot (o tecnico esta voltando com a
+// mesma senha). O hold e um timestamp RFC3339 em holdFile. Ausente/ilegivel/
 // expirado => sem hold (fail-secure: na duvida, rotaciona).
 func holdActive() bool {
 	v := readTrim(holdFile)
@@ -292,11 +296,14 @@ func holdActive() bool {
 	return false
 }
 
-// rotateOnBoot implementa §3.2: rotaciona 1x no startup do agente, exceto sob hold.
+// rotateOnBoot implementa §3.2: rotaciona 1x no startup do agente. Sob hold (a maquina
+// reiniciou no meio de um acesso) a rotacao e ADIADA: o tecnico volta com a mesma senha,
+// e so se ninguem voltar ela gira mais tarde (reboot_em_acesso.go).
 // Chamada em goroutine pelo worker() (faz exec + HTTP). rotateNow ja e idempotente
 // quanto a token/rustdesk_id ausentes e serializa em rotateMu com o retry loop.
 func rotateOnBoot() {
 	if holdActive() {
+		rotacaoAdiadaAposBoot()
 		return
 	}
 	// Passo 1: o boot e ROTINA — o modo decide, e ANTES da espera pelo cliente: nao faz
