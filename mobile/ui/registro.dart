@@ -158,6 +158,9 @@ class NovidadeApp {
 }
 
 const novidadesCelular = <NovidadeApp>[
+  NovidadeApp('2026.10.26', [
+    'Em Acessar, quando a conexão com um computador da empresa é recusada por causa do plano, o app agora diz o motivo: a empresa está sem plano ativo ou tem mais usuários do que o plano permite.',
+  ]),
   NovidadeApp('2026.10.20', [
     'Conheça o Otto, o mascote do AcessoFast: em Este celular ele mostra se o celular está pronto, sendo acessado ou se falta alguma coisa.',
     'Em Acessar, o Otto acompanha a conexão e, se não der certo, mostra o motivo e deixa tentar de novo.',

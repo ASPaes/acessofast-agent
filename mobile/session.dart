@@ -22,6 +22,8 @@
 //   N -> 0        : 'end'     + ROTAÇÃO da senha
 //   ocioso        : 'presence' a cada 60s — 10 min se o servidor diz que o
 //                   aparelho não está no cadastro (_presenceIntervalSemCadastro)
+//   corte vencido : derruba as conexões + 'end' + ROTAÇÃO. O corte vem no
+//                   hard_cap_at da resposta do start/heartbeat (ver _cortar).
 //
 // ---------------------------------------------------------------------------
 // INVARIANTE DA ROTAÇÃO (copiada do rotate.go — não inverter a ordem)
@@ -351,13 +353,15 @@ void _notarCadastro(int status) {
   }
 }
 
-/// Status HTTP da resposta; 0 se não postou (sem credencial) ou a rede falhou.
-Future<int> _postEvent(String event, {String? controllerId}) async {
+/// Corte que a resposta mandou armar (hard_cap_at), já no relógio deste
+/// aparelho. null se não veio, se não postou (sem credencial) ou se a rede
+/// falhou: falha nunca corta, como no main.go.
+Future<DateTime?> _postEvent(String event, {String? controllerId}) async {
   // Guarda idêntica ao postEvent do main.go: sem credencial a session-ingest
   // rejeitaria, e postar a cada 60s só geraria ruído.
   if (!await _loadCredentials()) {
     _log('SKIP $event: sem credencial (matrícula pendente?)');
-    return 0;
+    return null;
   }
   try {
     final body = <String, String>{
@@ -377,11 +381,45 @@ Future<int> _postEvent(String event, {String? controllerId}) async {
         .timeout(_httpTimeout);
     _log('$event -> HTTP ${r.statusCode}');
     _notarCadastro(r.statusCode);
-    return r.statusCode;
+    // O corpo vale qualquer que seja o status, como no postEventFull do
+    // main.go: o corte de controlador desconhecido vem num 403.
+    return _lerCorte(r);
   } catch (e) {
     _log('POST $event falhou: $e');
-    return 0;
+    return null;
   }
+}
+
+/// hard_cap_at da resposta, traduzido para o relógio deste aparelho.
+///
+/// O servidor manda um instante no relógio DELE ("agora", quando recusa a
+/// sessão). Comparado direto com o relógio do celular, o corte ficaria nas mãos
+/// de quem acerta a hora do aparelho: uma hora atrasado, e a conta bloqueada
+/// seguiria acessível por uma hora. Por isso vale QUANTO falta, medido contra o
+/// cabeçalho Date da mesma resposta. Sem Date legível, usa o instante como veio.
+DateTime? _lerCorte(http.Response r) {
+  String? valor;
+  try {
+    final j = jsonDecode(r.body);
+    if (j is Map && j['hard_cap_at'] is String) valor = j['hard_cap_at'] as String;
+  } catch (_) {
+    return null; // corpo que não é JSON (erro do gateway): nada a armar
+  }
+  if (valor == null || valor.isEmpty) return null;
+  final corte = DateTime.tryParse(valor);
+  if (corte == null) {
+    _log('WARN hard_cap_at ilegível: $valor');
+    return null;
+  }
+  final data = r.headers['date'];
+  if (data != null) {
+    try {
+      return DateTime.now().add(corte.difference(HttpDate.parse(data)));
+    } catch (_) {
+      // Date ilegível: segue com o instante do servidor
+    }
+  }
+  return corte;
 }
 
 /// Só conta como atendimento a conexão ACEITA. No Android o RustDesk põe na
@@ -415,6 +453,62 @@ int _prevActive = 0;
 // null = ainda não sabemos (nenhuma resposta desde que o app abriu). Ver
 // _notarCadastro e _presenceIntervalSemCadastro.
 bool? _cadastrado;
+// Timer.periodic não espera o callback async: sem esta trava, um POST lento
+// (até 20s) deixava a volta seguinte rodar junto, com _prevActive ainda velho —
+// 'start' e 'end' em dobro, e dois cortes disputando o mesmo atendimento. O
+// main.go não tem isso porque o worker é uma goroutine só.
+bool _ticking = false;
+// Teto da trava. A volta mais longa (corte: 'end' + reporte da senha, 20s cada)
+// cabe com folga; uma chamada que nunca volta não pode calar o aparelho para
+// sempre — passado o teto, a trava solta e a volta seguinte roda.
+const Duration _tickMaximo = Duration(minutes: 2);
+
+// Corte pedido pelo servidor (hard_cap_at), no relógio deste aparelho. É o
+// hardCapUntil do main.go: armado pela resposta do start/heartbeat, NUNCA
+// desarmado por uma resposta sem o campo (falha passageira não pode perder o
+// corte) e limpo no fim real da sessão, para não vazar para o próximo
+// atendimento. null = sem corte (crédito, plano pago).
+DateTime? _corteEm;
+
+void _armarCorte(DateTime? corte) {
+  if (corte == null) return;
+  if (_corteEm == null) _log('corte armado para ${corte.toIso8601String()}');
+  _corteEm = corte;
+}
+
+/// O corte venceu: conta bloqueada, empresa acima do plano, 2h do gratuito,
+/// fora do horário da empresa ou controlador desconhecido. Quem decide é o
+/// servidor; o aparelho só obedece. Como no checkHardCap do main.go, é o fim
+/// REAL do atendimento: derruba, encerra no banco e gira a senha que o técnico
+/// viu (só há atendimento com conexão aceita, então sempre houve senha vista).
+///
+/// A ordem difere do Windows de propósito. Lá a senha gira ANTES de reiniciar o
+/// cliente, porque a conexão derrubada pelo reinício volta sozinha. Aqui o
+/// closeAll faz o mesmo fechamento do "Encerrar" da tela: o RustDesk avisa o
+/// técnico que o outro lado fechou e ele NÃO reconecta sozinho. Então derruba
+/// primeiro, sem esperar rede. Se ele reconectar à mão antes do giro, a conexão
+/// nova manda outro 'start' e o servidor corta de novo.
+Future<void> _cortar() async {
+  _log('<<< CORTE: o servidor encerrou o atendimento — derrubando as conexões');
+  try {
+    final ids = gFFI.serverModel.clients.map((c) => c.id).toList();
+    // Esvazia a lista na hora, sem esperar o retorno do núcleo: o próximo tick
+    // já vê o aparelho ocioso e não reabre a sessão com outro 'start'.
+    await gFFI.serverModel.closeAll();
+    for (final id in ids) {
+      gFFI.invokeMethod('cancel_notification', id);
+    }
+  } catch (e) {
+    // _corteEm segue vencido: o próximo tick tenta derrubar de novo.
+    _log('WARN o corte não derrubou as conexões: $e');
+    return;
+  }
+  _corteEm = null;
+  _prevActive = 0;
+  await _postEvent('end');
+  await _rotateNow();
+  _lastPresence = DateTime.now();
+}
 DateTime _lastHeartbeat = DateTime.fromMillisecondsSinceEpoch(0);
 DateTime _lastPresence = DateTime.fromMillisecondsSinceEpoch(0);
 DateTime _lastRetry = DateTime.fromMillisecondsSinceEpoch(0);
@@ -505,14 +599,15 @@ Future<void> _tick() async {
   }
 
   if (_prevActive == 0 && active > 0) {
-    await _postEvent('start', controllerId: _controllerId());
+    _armarCorte(await _postEvent('start', controllerId: _controllerId()));
     _lastHeartbeat = now;
   } else if (active > 0) {
     if (now.difference(_lastHeartbeat) >= _heartbeatInterval) {
-      await _postEvent('heartbeat');
+      _armarCorte(await _postEvent('heartbeat'));
       _lastHeartbeat = now;
     }
   } else if (_prevActive > 0 && active == 0) {
+    _corteEm = null; // fim real: o corte desta sessão não vale para a próxima
     await _postEvent('end');
     // Fase 2: a senha que o técnico viu nesta sessão morre aqui.
     await _rotateNow();
@@ -532,6 +627,13 @@ Future<void> _tick() async {
   }
 
   _prevActive = active;
+
+  // Depois do start/heartbeat da mesma volta: a recusa (corte = agora) derruba
+  // já, sem esperar o próximo tick.
+  final corte = _corteEm;
+  if (active > 0 && corte != null && !DateTime.now().isBefore(corte)) {
+    await _cortar();
+  }
 }
 
 /// Passa o aparelho a usar SENHA PERMANENTE. Sem isto o app fica na "senha de
@@ -607,10 +709,14 @@ void acessofastSessionStart() {
       await _retryPendingRotation();
 
       Timer.periodic(_pollInterval, (_) async {
+        if (_ticking) return; // a volta anterior ainda espera a rede
+        _ticking = true;
         try {
-          await _tick();
+          await _tick().timeout(_tickMaximo);
         } catch (e) {
           _log('tick falhou: $e');
+        } finally {
+          _ticking = false;
         }
       });
       _log('observador de sessão ativo');

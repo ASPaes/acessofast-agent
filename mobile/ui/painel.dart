@@ -559,7 +559,12 @@ class Painel extends ChangeNotifier {
     if (e.contains('aguardando_agente')) return 'O computador ainda não confirmou a senha nova. Tente de novo em instantes.';
     if (e.contains('quota_exceeded')) return 'Limite de sessões simultâneas do plano atingido. Encerre uma sessão para conectar em outro computador.';
     if (e.contains('no_credits')) return 'Sem acessos gratuitos e sem créditos disponíveis. Compre créditos ou conheça os planos no painel.';
-    if (e.contains('billing_blocked')) return 'Conta bloqueada por pendência de pagamento. Regularize na aba Financeiro do painel.';
+    // Pagamento pendente, teste encerrado ou prazo para contratar encerrado: o
+    // servidor manda o mesmo código para os três.
+    if (e.contains('billing_blocked')) return 'Conta bloqueada: a empresa está sem plano ativo. O administrador regulariza na aba Financeiro do painel.';
+    // Plano contratado com menos vagas que os usuários ativos: ninguém da empresa
+    // conecta até o administrador escolher no painel quem continua.
+    if (e.contains('usuarios_acima_do_plano')) return 'Acessos pausados: a empresa tem mais usuários ativos do que o plano permite. O administrador precisa escolher no painel quem continua.';
     if (e.contains('conta_inativa')) return 'Empresa inativa. Fale com o suporte para reativar a conta.';
     if (e.contains('user_inactive')) return 'Seu usuário está desativado. Fale com o administrador da sua empresa.';
     if (e.contains('fora_do_horario')) return 'Fora do horário de acesso definido pela sua empresa.';
