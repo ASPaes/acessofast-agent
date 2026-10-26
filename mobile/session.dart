@@ -458,6 +458,10 @@ bool? _cadastrado;
 // 'start' e 'end' em dobro, e dois cortes disputando o mesmo atendimento. O
 // main.go não tem isso porque o worker é uma goroutine só.
 bool _ticking = false;
+// Teto da trava. A volta mais longa (corte: 'end' + reporte da senha, 20s cada)
+// cabe com folga; uma chamada que nunca volta não pode calar o aparelho para
+// sempre — passado o teto, a trava solta e a volta seguinte roda.
+const Duration _tickMaximo = Duration(minutes: 2);
 
 // Corte pedido pelo servidor (hard_cap_at), no relógio deste aparelho. É o
 // hardCapUntil do main.go: armado pela resposta do start/heartbeat, NUNCA
@@ -708,7 +712,7 @@ void acessofastSessionStart() {
         if (_ticking) return; // a volta anterior ainda espera a rede
         _ticking = true;
         try {
-          await _tick();
+          await _tick().timeout(_tickMaximo);
         } catch (e) {
           _log('tick falhou: $e');
         } finally {
