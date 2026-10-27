@@ -292,6 +292,12 @@ type ingestResp struct {
 	// Passo 2: senha definida no painel e ainda nao aplicada nesta maquina. So vem no
 	// 'presence', e volta a cada presence ate o agente confirmar. Ver senha_painel.go.
 	Senha *senhaDoPainel `json:"senha"`
+	// Logo da empresa no app (marca.go). So vem no 'presence', e so quando muda: versao nova
+	// com URL assinada, ou versao "" para tirar a logo desta maquina.
+	Marca *marcaServidor `json:"marca"`
+	// De onde veio o acesso em curso: "painel", "externo" ou "desconhecido" (marca.go). Vem em
+	// start/heartbeat; a janela de acesso do app escolhe por ela entre o selo e o aviso.
+	OrigemAcesso string `json:"origem_acesso"`
 }
 
 type avisoServidor struct {
@@ -317,6 +323,10 @@ func postEvent(event string, controllerID string) time.Time {
 // postEventFull e o POST de verdade. Devolve tambem o bloco de update, que so o
 // ramo de 'presence' do worker consome.
 func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
+	// Fim da sessao: a origem do acesso que acabou nao vale mais para a janela do app.
+	if event == "end" {
+		tiraOrigemAcesso()
+	}
 	// Guarda: sem credencial, nao adianta postar — a session-ingest rejeitaria.
 	// Evita ruido de POST invalido a cada 60s quando a matricula ainda nao rodou.
 	if token == "" || rustdeskID == "" {
@@ -347,6 +357,10 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 		if v := versaoDoApp(); v != "" {
 			m["client_version"] = v
 		}
+		// Logo da empresa (marca.go): a versao que esta maquina ja tem, "" sem logo. Vai
+		// sempre, mesmo vazia — o campo presente e o que diz ao servidor que este agente sabe
+		// gravar a logo.
+		m["marca_versao"] = marcaVersaoAtual()
 	}
 	payload, _ := json.Marshal(m)
 	req, err := http.NewRequest("POST", ingestURL, bytes.NewReader(payload))
@@ -413,6 +427,15 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 	// os dois vierem juntos, a senha e aplicada e confirmada antes de o servico reiniciar.
 	if r.Senha != nil {
 		aplicaSenhaDoPainel(r.Senha)
+	}
+
+	// Logo da empresa e origem do acesso (marca.go): efeitos colaterais da resposta, como o
+	// aviso. A logo so vem no presence; a origem, em start/heartbeat.
+	if r.Marca != nil {
+		aplicaMarca(r.Marca)
+	}
+	if r.OrigemAcesso != "" {
+		gravaOrigemAcesso(r.OrigemAcesso)
 	}
 
 	// Atualizacao do app: guardada para o worker aplicar depois do update do agente, no
