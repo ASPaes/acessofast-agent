@@ -47,7 +47,9 @@
 ; de agente: ela se declara no painel e obedece ao alvo de update.
 ; 3.2.0 (2026-10-07): o cliente passa a ser o APP NOVO (release app-<versao>, o mesmo
 ; que o agente instala na frota). Espera da instalacao por conferencia, nao por tempo.
-#define MyAppVersion     "3.2.0"
+; 3.3.0 (2026-10-27): so payload novo (agente 2026.10.21-6cfdad9 + app 2026.10.23-48be6de).
+; O 3.2.0 ficou 20 dias no site e toda maquina nova nascia com a versao de 06/10.
+#define MyAppVersion     "3.3.0"
 #define MyAppPublisher   "AcessoFast"
 #define MyAppURL         "https://acessofast.com.br"
 #define AgentServiceName "AcessoFastAgent"
