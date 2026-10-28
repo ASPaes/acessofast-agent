@@ -456,6 +456,10 @@ type tailer struct {
 	primed bool
 	open   map[string]time.Time // #N aberto -> instante em que vimos o "opened"
 
+	// arquivo: identidade do arquivo de onde vem offset. E ela que denuncia a rotacao
+	// quando o arquivo novo ja nasce maior que offset. Ver leLog().
+	arquivo os.FileInfo
+
 	// pending: sobra da ultima leitura SEM "\n" no fim. O poll le o arquivo a cada 3s e
 	// pode cair no meio de uma linha que o cliente ainda esta escrevendo; sem guardar o
 	// pedaco, um "#N Connection closed" partido virava dois fragmentos, nenhum casava
@@ -763,47 +767,94 @@ func (t *tailer) fatiaLinhas(chunk string) []string {
 
 // tailRotacionado devolve o que ficou no arquivo ANTIGO a partir de 'from'. O cliente
 // rotaciona renomeando o _rCURRENT.log e criando um novo no lugar, entao o trecho
-// escrito entre o nosso ultimo poll e o rename so existe no irmao renomeado. Pega o
-// AcessoFast_r*.log mais recente do mesmo diretorio que nao seja o proprio _rCURRENT;
+// escrito entre o nosso ultimo poll e o rename so existe no irmao renomeado. O irmao e
+// achado pela identidade (antigo), que o rename preserva, e nao pela data: o cliente pode
+// rotacionar mais de uma vez entre dois polls (27/10/2026, PC do Luiz: tres arquivos em
+// 8 s), e o rotacionado mais recente nao e o que liamos. Por isso tambem nao ha mais prazo:
+// o arquivo e o nosso e 'from' e onde paramos, entao nada dali em diante e historico.
 // "" quando nao ha nada a recuperar.
-func tailRotacionado(cur string, from int64) string {
+func tailRotacionado(cur string, antigo os.FileInfo, from int64) string {
+	if antigo == nil {
+		return ""
+	}
 	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(cur), "AcessoFast_r*.log"))
-	var best string
-	var bestT time.Time
 	for _, m := range matches {
 		if strings.EqualFold(m, cur) {
 			continue
 		}
 		fi, err := os.Stat(m)
-		if err != nil || !fi.ModTime().After(bestT) {
+		if err != nil || !os.SameFile(antigo, fi) {
 			continue
 		}
-		bestT, best = fi.ModTime(), m
+		if fi.Size() <= from {
+			return ""
+		}
+		f, err := os.Open(m)
+		if err != nil {
+			return ""
+		}
+		defer f.Close()
+		if _, err := f.Seek(from, io.SeekStart); err != nil {
+			return ""
+		}
+		data, err := io.ReadAll(f)
+		if err != nil || len(data) == 0 {
+			return ""
+		}
+		logln("rotacao: recuperando %d byte(s) da cauda de %s", len(data), filepath.Base(m))
+		return string(data)
 	}
-	// So aceita rotacionado recem-fechado: um arquivo velho aqui seria historico, e
-	// reprocessar historico reabriria #N ja encerrado. 10 min cobre de sobra a distancia
-	// entre o rename e o nosso poll de 3s.
-	if best == "" || time.Since(bestT) > 10*time.Minute {
-		return ""
-	}
-	fi, err := os.Stat(best)
-	if err != nil || fi.Size() <= from {
-		return ""
-	}
-	f, err := os.Open(best)
+	return ""
+}
+
+// leLog devolve as linhas novas de p desde o poll anterior, com a cauda do arquivo antigo
+// na frente quando o cliente rotacionou no meio. ok=false: nao deu para ler agora.
+//
+// A rotacao e reconhecida pela IDENTIDADE do arquivo (volume + indice no NTFS, via
+// os.SameFile), nao so pelo tamanho. Em 27/10/2026, no PC do Luiz, o cliente trocou de
+// arquivo e o novo, quando o agente o viu, ja passava do ponto onde ele tinha parado no
+// antigo: pelo tamanho nada tinha mudado, o agente seguiu lendo do meio do arquivo novo e
+// pulou o "Connection opened" do acesso de 28/10 09:11. Sem sessao nao houve cobranca, nem
+// o selo da empresa na janela de acesso. O tamanho fica como segundo sinal, para o arquivo
+// truncado no lugar (mesma identidade, menor).
+func (t *tailer) leLog(p string) ([]string, bool) {
+	f, err := os.Open(p)
 	if err != nil {
-		return ""
+		return nil, false
 	}
 	defer f.Close()
-	if _, err := f.Seek(from, io.SeekStart); err != nil {
-		return ""
+	// Pelo handle, e nao pelo caminho: tamanho e identidade saem do mesmo arquivo que vai
+	// ser lido logo abaixo.
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, false
 	}
-	data, err := io.ReadAll(f)
-	if err != nil || len(data) == 0 {
-		return ""
+	var linhas []string
+	trocou := t.arquivo != nil && !os.SameFile(t.arquivo, fi)
+	if trocou || fi.Size() < t.offset {
+		// A cauda do arquivo ANTIGO (o que o cliente escreveu entre o ultimo poll e o
+		// rename) sairia de cena junto com ele. E exatamente ali que um "#N Connection
+		// closed" se perde e a sessao vira fantasma — entao recuperamos antes de zerar.
+		// Nao primado nao tem cauda: o prime le o arquivo novo inteiro.
+		if t.primed {
+			linhas = t.fatiaLinhas(tailRotacionado(p, t.arquivo, t.offset))
+		}
+		if fi.Size() >= t.offset {
+			logln("log rotacionou sem encolher (%d >= %d bytes); relendo do novo arquivo (abertas: %d)",
+				fi.Size(), t.offset, len(t.open))
+		} else {
+			logln("log rotacionou; relendo do novo arquivo (abertas: %d)", len(t.open))
+		}
+		t.offset = 0
+		t.pending = "" // o resto parcial era do arquivo antigo
+		// NAO limpa t.open nem re-prima: as conexoes abertas atravessam a
+		// rotacao; so voltamos a ler o novo arquivo do inicio.
 	}
-	logln("rotacao: recuperando %d byte(s) da cauda de %s", len(data), filepath.Base(best))
-	return string(data)
+	t.arquivo = fi
+	f.Seek(t.offset, io.SeekStart)
+	data, _ := io.ReadAll(f)
+	t.offset += int64(len(data))
+	return append(linhas, t.fatiaLinhas(string(data))...), true
 }
 
 func (t *tailer) poll() {
@@ -828,6 +879,7 @@ func (t *tailer) poll() {
 			}
 			t.primed = false // re-prima do log novo
 			t.offset = 0
+			t.arquivo = nil
 			// O cliente subiu de novo lendo a config do disco: a senha que ele passa a
 			// exigir pode nao ser a que o painel conhece. Re-sincroniza (o rotateNow so
 			// aplica com o cliente de pe, e aqui ele acabou de subir).
@@ -846,39 +898,12 @@ func (t *tailer) poll() {
 		t.offset = 0
 		t.primed = false
 		t.pending = ""
+		t.arquivo = nil
 	}
-	fi, err := os.Stat(p)
-	if err != nil {
+	lines, ok := t.leLog(p)
+	if !ok {
 		return
 	}
-	if fi.Size() < t.offset { // rotacionou/truncou
-		// A cauda do arquivo ANTIGO (o que o cliente escreveu entre o ultimo poll e o
-		// rename) sairia de cena junto com ele. E exatamente ali que um "#N Connection
-		// closed" se perde e a sessao vira fantasma — entao recuperamos antes de zerar.
-		// Nao primado nao chega aqui (offset 0 nunca e maior que o tamanho).
-		if t.primed {
-			for _, ln := range t.fatiaLinhas(tailRotacionado(p, t.offset)) {
-				if ln != "" {
-					t.processLine(ln)
-				}
-			}
-		}
-		t.offset = 0
-		t.pending = "" // o resto parcial era do arquivo antigo
-		// NAO limpa t.open nem re-prima: as conexoes abertas atravessam a
-		// rotacao; so voltamos a ler o novo arquivo do inicio.
-		logln("log rotacionou; relendo do novo arquivo (abertas: %d)", len(t.open))
-	}
-	f, err := os.Open(p)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	f.Seek(t.offset, io.SeekStart)
-	data, _ := io.ReadAll(f)
-	t.offset += int64(len(data))
-
-	lines := t.fatiaLinhas(string(data))
 	if !t.primed {
 		// Reconstrucao de estado no boot: reproduz opened/closed do arquivo
 		// atual SEM postar eventos historicos. Se sobrar #N aberto, ha sessao
