@@ -264,6 +264,8 @@ var httpClient = &http.Client{Timeout: 12 * time.Second}
 // start/heartbeat de sessao FREE iniciada pelo painel; ausente/vazio nos demais.
 type ingestResp struct {
 	HardCapAt string `json:"hard_cap_at"`
+	// Sessao do servidor que este sinal alimenta (ver computador_de_origem.go).
+	SessionID string `json:"session_id"`
 	// Passo 2: bloco de auto-update. So vem em 'presence' (maquina ociosa) e so
 	// quando o alvo resolvido no servidor difere da versao que este agente reportou.
 	// Ver update.go.
@@ -437,6 +439,9 @@ func postEventFull(event string, controllerID string) (time.Time, *updateInfo) {
 	if r.OrigemAcesso != "" {
 		gravaOrigemAcesso(r.OrigemAcesso)
 	}
+	if (event == "start" || event == "heartbeat") && r.SessionID != "" {
+		marcaSessaoNoServidor(r.SessionID)
+	}
 
 	// Atualizacao do app: guardada para o worker aplicar depois do update do agente, no
 	// mesmo tick do presence (atualiza_app.go). So do presence, que prova a maquina ociosa.
@@ -490,6 +495,10 @@ type tailer struct {
 	// por isso o start inicial vai sem ele e re-postamos start ao aprender o peer_id.
 	// Limpo no fim real da sessao (nao vaza pro proximo atendimento).
 	controllerID string
+
+	// origemInformadaEm: ultima sessao do servidor que recebeu o controllerID. Ver
+	// computador_de_origem.go.
+	origemInformadaEm string
 
 	// semSocketDesde: instante em que o cliente branded passou a NAO ter nenhum socket
 	// de sessao, com #N ainda aberto. Zero = ha socket (ou nao houve leitura confiavel).
@@ -617,12 +626,12 @@ func (t *tailer) processLine(line string) {
 		if _, open := t.open[id]; open {
 			t.marcaAutenticada(fmt.Sprintf("peer_id do #%s", id))
 		}
-		if _, open := t.open[id]; open && t.controllerID == "" {
+		// Computador diferente do que ja se conhecia tambem avisa: outra pessoa entrou no mesmo
+		// acesso, e o log de seguranca precisa saber (ver computador_de_origem.go).
+		if _, open := t.open[id]; open && t.controllerID != peer {
 			t.controllerID = peer
 			logln(">>> peer_id do #%s = %s (controlador) — reenviando start com controlador", id, peer)
-			if hc := postEvent("start", t.controllerID); !hc.IsZero() {
-				t.hardCapUntil = hc
-			}
+			t.postaOrigem()
 		}
 		return
 	}
@@ -1019,7 +1028,8 @@ func worker(stop <-chan struct{}) {
 				if hc := postEvent("heartbeat", ""); !hc.IsZero() {
 					t.hardCapUntil = hc
 				}
-				t.renovaHold() // reiniciou no meio do acesso -> a senha espera o tecnico
+				t.informaOrigem() // sessao nova no servidor -> informa de onde veio o acesso
+				t.renovaHold()    // reiniciou no meio do acesso -> a senha espera o tecnico
 			}
 		case <-presT.C:
 			// Durante a carencia (§3.1) a sessao ainda nao terminou de fato -> nao
